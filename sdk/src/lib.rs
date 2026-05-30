@@ -166,14 +166,51 @@ struct EmacsMessage<T: Serialize> {
 }
 
 pub fn emacs_post_message<T: Serialize>(action: &str, payload: T) {
-    let msg = EmacsMessage {
-        action: action.to_string(),
-        payload,
-    };
-    if let Ok(json_str) = serde_json::to_string(&msg) {
+    if let Ok(payload_json) = serde_json::to_string(&payload) {
+        // 1. Mutate document.title as a fallback / visual hook indicator
+        let msg = serde_json::json!({
+            "action": action,
+            "payload": payload
+        });
+        if let Ok(json_str) = serde_json::to_string(&msg) {
+            if let Some(win) = web_sys::window() {
+                if let Some(doc) = win.document() {
+                    doc.set_title(&json_str);
+                }
+            }
+        }
+
+        // 2. Extract session and port from URL hash and perform a non-blocking loopback fetch request.
+        // This is the primary and 100% reliable mechanism defined in the emacs-egui HTTP API.
         if let Some(win) = web_sys::window() {
-            if let Some(doc) = win.document() {
-                doc.set_title(&json_str);
+            if let Ok(hash) = win.location().hash() {
+                let hash_clean = hash.trim_start_matches('#');
+                let mut session = None;
+                let mut port = None;
+                for part in hash_clean.split('&') {
+                    let mut kv = part.splitn(2, '=');
+                    if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
+                        if k == "session" {
+                            session = Some(v.to_string());
+                        } else if k == "port" {
+                            port = v.parse::<u16>().ok();
+                        }
+                    }
+                }
+
+                if let (Some(sess), Some(p)) = (session, port) {
+                    let encoded_payload = js_sys::encode_uri_component(&payload_json);
+                    let url = format!(
+                        "http://127.0.0.1:{}/api/event?session={}&action={}&payload={}",
+                        p, sess, action, encoded_payload
+                    );
+                    
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Some(win) = web_sys::window() {
+                            let _ = win.fetch_with_str(&url);
+                        }
+                    });
+                }
             }
         }
     }

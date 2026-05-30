@@ -254,6 +254,43 @@ Keys are \"session-id:action\", value is callback function.")
         (xwidget-webkit-execute-script xwidget script)))))
 
 ;; ---------------------------------------------------------------------------
+;; IPC: Inbound WASM -> Lisp (Title Change Hook Gateway)
+;; ---------------------------------------------------------------------------
+
+(defvar xwidget-webkit-title-change-hook nil
+  "Hook run when an xwidget webkit title changes.
+Custom Emacs builds on macOS call this hook to pass messages from JS/WASM.")
+
+(defun emacs-egui--handle-title-change (&rest args)
+  "Handle inbound events from the XWIDGET title change gateway.
+ARGS is the list of arguments passed by the hook."
+  (message "emacs-egui IPC: hook triggered with args: %S" args)
+  (let* ((xwidget (cl-find-if #'xwidget-live-p args))
+         (title (cl-find-if #'stringp args))
+         session)
+    (message "emacs-egui IPC: detected xwidget=%S, title=%S" xwidget title)
+    (when (and xwidget title)
+      (maphash (lambda (_id s)
+                 (when (eq (plist-get s :xwidget) xwidget)
+                   (setq session s)))
+               emacs-egui--sessions)
+      (if (not session)
+          (message "emacs-egui IPC: session not found for xwidget %s" xwidget)
+        (let* ((session-id (plist-get session :id))
+               (parsed (ignore-errors (json-read-from-string title)))
+               (action (and parsed (cdr (assoc 'action parsed))))
+               (payload (and parsed (cdr (assoc 'payload parsed)))))
+          (message "emacs-egui IPC: parsed action=%S, payload=%S" action payload)
+          (when (and action payload)
+            (let ((cb (gethash (format "%s:%s" session-id action) emacs-egui--callbacks)))
+              (if (not cb)
+                  (message "emacs-egui IPC: callback not found for action '%s'" action)
+                (message "emacs-egui IPC: scheduling callback for '%s'" action)
+                (run-at-time 0 nil cb payload)))))))))
+
+(add-hook 'xwidget-webkit-title-change-hook #'emacs-egui--handle-title-change)
+
+;; ---------------------------------------------------------------------------
 ;; Session & Buffer Lifecycle
 ;; ---------------------------------------------------------------------------
 
