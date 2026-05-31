@@ -52,7 +52,8 @@ Populated by `emacs-egui-register-app'.")
 
 (defun emacs-egui-register-app (app-name ui-dir)
   "Register APP-NAME with its UI-DIR (absolute path to the UI directory).
-Consumer packages call this at load time so the framework can locate their assets."
+Consumer packages call this at load time so the framework can locate
+their assets."
   (puthash app-name (file-name-as-directory (expand-file-name ui-dir))
            emacs-egui--app-registry))
 
