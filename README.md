@@ -91,8 +91,7 @@ An emacs-egui app has two layers:
 
 ```text
 my-emacs-app/
-├── deps/
-│   └── emacs-egui/          # git submodule
+├── emacs-egui/              # git submodule
 ├── ui/                      # Rust WASM crate (the UI layer)
 │   ├── Cargo.toml
 │   ├── src/
@@ -108,7 +107,7 @@ my-emacs-app/
 ```sh
 mkdir my-emacs-app && cd my-emacs-app
 git init
-git submodule add https://github.com/nohzafk/emacs-egui.git deps/emacs-egui
+git submodule add https://github.com/nohzafk/emacs-egui.git emacs-egui
 cargo new --lib ui
 ```
 
@@ -124,7 +123,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-emacs-egui-sdk = { path = "../deps/emacs-egui/sdk" }
+emacs-egui-sdk = { path = "../emacs-egui/sdk" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 wasm-bindgen = "0.2"
@@ -297,7 +296,7 @@ Create `lisp/my-emacs-app.el`:
   ;; Auto-load bundled emacs-egui from the submodule
   (unless (featurep 'emacs-egui)
     (add-to-list 'load-path
-                 (expand-file-name "../deps/emacs-egui/lisp/" my-emacs-app--dir)))
+                 (expand-file-name "../emacs-egui/lisp/" my-emacs-app--dir)))
   (require 'emacs-egui))
 
 ;; Version gate
@@ -391,17 +390,16 @@ pub trait EguiEmacsApp {
 
 ## Distribution Model
 
-Consumer apps include `emacs-egui` as a **git submodule** under `deps/emacs-egui/`. This bundles everything -- the Rust SDK (for `wasm-pack` compilation) and the Elisp runtime (for Emacs) -- so users only clone one repo.
+Consumer apps include `emacs-egui` as a **git submodule** at the repository root. This bundles everything -- the Rust SDK (for `wasm-pack` compilation) and the Elisp runtime (for Emacs) -- so users only clone one repo.
 
 ```text
 my-app/
-├── deps/
-│   └── emacs-egui/              # git submodule
-│       ├── sdk/                 # Rust SDK (path dep in Cargo.toml)
-│       └── lisp/
-│           └── emacs-egui.el    # Elisp runtime (auto-loaded by consumer)
+├── emacs-egui/                  # git submodule
+│   ├── sdk/                     # Rust SDK (path dep in Cargo.toml)
+│   └── lisp/
+│       └── emacs-egui.el        # Elisp runtime (auto-loaded by consumer)
 ├── ui/
-│   ├── Cargo.toml               # depends on ../deps/emacs-egui/sdk
+│   ├── Cargo.toml               # depends on ../emacs-egui/sdk
 │   ├── src/lib.rs
 │   ├── index.html
 │   └── pkg/                     # pre-built WASM (committed)
@@ -411,7 +409,7 @@ my-app/
 
 **For users:** clone with `--recurse-submodules`, add `lisp/` to `load-path`. One entry.
 
-**For developers:** `git submodule update --remote deps/emacs-egui` pulls framework updates.
+**For developers:** `git submodule update --remote emacs-egui` pulls framework updates.
 
 **Multiple apps:** `(require 'emacs-egui)` is idempotent -- whichever app loads first provides it. Use `emacs-egui-version` to gate on minimum version.
 
