@@ -286,15 +286,19 @@ wasm-pack build --target web --release --out-dir ui/pkg
 Create `lisp/my-emacs-app.el`:
 
 ```elisp
-(defvar my-emacs-app--dir
-  (file-name-directory (or load-file-name buffer-file-name))
-  "Directory containing my-emacs-app lisp files.")
+(eval-and-compile
+  (defvar my-emacs-app--dir
+    (file-name-directory (or load-file-name
+                             (bound-and-true-p byte-compile-current-file)
+                             buffer-file-name
+                             default-directory))
+    "Directory containing my-emacs-app lisp files.")
 
-;; Auto-load bundled emacs-egui from the submodule
-(unless (featurep ‘emacs-egui)
-  (add-to-list ‘load-path
-               (expand-file-name "../deps/emacs-egui/lisp/" my-emacs-app--dir)))
-(require ‘emacs-egui)
+  ;; Auto-load bundled emacs-egui from the submodule
+  (unless (featurep 'emacs-egui)
+    (add-to-list 'load-path
+                 (expand-file-name "../deps/emacs-egui/lisp/" my-emacs-app--dir)))
+  (require 'emacs-egui))
 
 ;; Version gate
 (when (version< emacs-egui-version "0.1.0")
@@ -315,7 +319,7 @@ Create `lisp/my-emacs-app.el`:
     (emacs-egui-on session "incremented"
                    (lambda (payload)
                      (message "Count is now: %d"
-                              (emacs-egui-get-field payload ‘new_count))))
+                              (emacs-egui-get-field payload 'new_count))))
 
     (switch-to-buffer (plist-get session :buffer))
 
@@ -323,13 +327,13 @@ Create `lisp/my-emacs-app.el`:
     (run-with-timer 0.6 nil
                     (lambda ()
                       (emacs-egui-send-state
-                       session ‘((username . "World")
+                       session '((username . "World")
                                  (counter . 0)))))))
 ```
 
 Users only need one `load-path` entry — the bundled submodule is discovered automatically:
 ```elisp
-(add-to-list ‘load-path "/path/to/my-emacs-app/lisp")
+(add-to-list 'load-path "/path/to/my-emacs-app/lisp")
 ```
 
 ---
@@ -409,7 +413,25 @@ my-app/
 
 **For developers:** `git submodule update --remote deps/emacs-egui` pulls framework updates.
 
-**Multiple apps:** `(require ‘emacs-egui)` is idempotent -- whichever app loads first provides it. Use `emacs-egui-version` to gate on minimum version.
+**Multiple apps:** `(require 'emacs-egui)` is idempotent -- whichever app loads first provides it. Use `emacs-egui-version` to gate on minimum version.
+
+### Packaging and Autoloading (The Dependency Caveat)
+
+Because standard Emacs package managers (like `package.el`, Straight, or Elpaca) automatically activate packages by looking up their declared dependencies in public archives (e.g., `Package-Requires: ((emacs-egui "0.1.0"))`), local development checkouts that bundle `emacs-egui` as a Git submodule require special care:
+
+1. **Standard Activation Failures:** If `emacs-egui` is not published to public archives (like ELPA/MELPA), standard package activation will fail to satisfy the dependency and skip activating your package. This means your package's `;;;###autoload` cookies will **not** be registered at Emacs boot.
+2. **Recommended Configuration Pattern:** To support direct Git clones and local development configurations (like Doom Emacs or Emacs Hypervisor), instruct your users to bypass the package manager's activation pipeline by manually adding the `lisp/` folder to the `load-path` and loading the autoloads file:
+   ```elisp
+   (let ((dir (expand-file-name "~/projects/my-emacs-app/lisp")))
+     (when (file-directory-p dir)
+       (add-to-list 'load-path dir)
+       (load "my-emacs-app-autoloads" nil t)
+       (keymap-set global-map "C-c m a" #'my-emacs-app-open)))
+   ```
+   This pattern guarantees:
+   - Your package remains fully **lazy-loaded** (boosting startup performance).
+   - The robust `eval-and-compile` submodule block in your main `.el` file successfully resolves the nested Git submodule dependency at runtime.
+   - It completely bypasses built-in package manager dependency lookup issues.
 
 ---
 
