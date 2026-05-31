@@ -2,6 +2,15 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
+// Re-export key dependencies so consumer crates don't need to declare them.
+pub use egui;
+pub use eframe;
+pub use wasm_bindgen;
+pub use wasm_bindgen_futures;
+pub use js_sys;
+pub use serde;
+pub use serde_json;
+
 lazy_static::lazy_static! {
     static ref REPAINT_SIGNAL: Mutex<Option<egui::Context>> = Mutex::new(None);
     static ref STATE_MESSAGE_QUEUE: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -31,7 +40,75 @@ impl Default for ThemeColors {
     }
 }
 
-/// The EguiEmacsApp trait. Applications built inside the emacs-egui framework
+/// Session parameters parsed from the URL hash fragment.
+/// The Elisp runtime embeds these when creating the xwidget session.
+#[derive(Clone, Debug)]
+pub struct SessionParams {
+    pub session_id: String,
+    pub port: u16,
+}
+
+/// Parse session parameters (session ID and server port) from the URL hash fragment.
+/// Returns defaults if parsing fails or running outside a browser.
+pub fn parse_session_params() -> SessionParams {
+    let (mut session_id, mut port) = ("default-session".to_string(), 8080u16);
+
+    if let Some(win) = web_sys::window() {
+        if let Ok(hash) = win.location().hash() {
+            let hash_clean = hash.trim_start_matches('#');
+            if let Ok(params) = web_sys::UrlSearchParams::new_with_str(hash_clean) {
+                if let Some(s) = params.get("session") {
+                    session_id = s;
+                }
+                if let Some(p) = params.get("port") {
+                    if let Ok(parsed) = p.parse::<u16>() {
+                        port = parsed;
+                    }
+                }
+            }
+        }
+    }
+
+    SessionParams { session_id, port }
+}
+
+/// Build the URL to fetch a local file through the Elisp HTTP server's file gateway.
+///
+/// The Elisp server exposes `/api/file?path=<encoded>` to stream local files
+/// as raw bytes into the WASM sandbox.
+pub fn file_url(path: &str) -> String {
+    let params = parse_session_params();
+    let encoded = js_sys::encode_uri_component(path);
+    format!("http://127.0.0.1:{}/api/file?path={}", params.port, encoded)
+}
+
+/// Fetch raw bytes from a URL. Convenience wrapper around the browser fetch API.
+///
+/// Commonly used with [`file_url`] to load local files through the Elisp server:
+/// ```ignore
+/// let url = emacs_egui_sdk::file_url("/path/to/data.parquet");
+/// let bytes = emacs_egui_sdk::fetch_bytes(&url).await?;
+/// ```
+pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
+    use wasm_bindgen::JsCast;
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
+    let resp_value = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await?;
+    let resp: web_sys::Response = resp_value.dyn_into()?;
+
+    if !resp.ok() {
+        return Err(JsValue::from_str(&format!("HTTP status {}", resp.status())));
+    }
+
+    let array_buffer_value = wasm_bindgen_futures::JsFuture::from(resp.array_buffer()?).await?;
+    let array_buffer: js_sys::ArrayBuffer = array_buffer_value.dyn_into()?;
+    let typed_array = js_sys::Uint8Array::new(&array_buffer);
+
+    let mut bytes = vec![0; typed_array.length() as usize];
+    typed_array.copy_to(&mut bytes);
+    Ok(bytes)
+}
+
+/// The EguiEmacsApp trait. Applications built with the emacs-egui framework
 /// implement this trait instead of raw eframe::App.
 pub trait EguiEmacsApp {
     type State: serde::de::DeserializeOwned;
@@ -126,7 +203,7 @@ fn apply_theme_to_ctx(ctx: &egui::Context, theme: &ThemeColors) {
     let is_dark = luminance(bg) < 128;
 
     let mut style = (*ctx.style()).clone();
-    
+
     // Setup general spacing & sizing
     let text_size = theme
         .font_size
@@ -135,7 +212,7 @@ fn apply_theme_to_ctx(ctx: &egui::Context, theme: &ThemeColors) {
         .clamp(10.0, 14.0);
 
     style.override_text_style = Some(egui::TextStyle::Body);
-    
+
     // Set custom fonts sizes
     for (_, font_id) in style.text_styles.iter_mut() {
         font_id.size = text_size;
@@ -158,13 +235,9 @@ fn apply_theme_to_ctx(ctx: &egui::Context, theme: &ThemeColors) {
     ctx.set_style(style);
 }
 
-/// Posts an action message back to Emacs by mutating document.title
-#[derive(Serialize)]
-struct EmacsMessage<T: Serialize> {
-    action: String,
-    payload: T,
-}
-
+/// Posts an action message back to Emacs via two channels:
+/// 1. Mutates `document.title` (fallback for macOS title-change hook)
+/// 2. Non-blocking loopback HTTP fetch to the Elisp server
 pub fn emacs_post_message<T: Serialize>(action: &str, payload: T) {
     if let Ok(payload_json) = serde_json::to_string(&payload) {
         // 1. Mutate document.title as a fallback / visual hook indicator
@@ -180,39 +253,19 @@ pub fn emacs_post_message<T: Serialize>(action: &str, payload: T) {
             }
         }
 
-        // 2. Extract session and port from URL hash and perform a non-blocking loopback fetch request.
-        // This is the primary and 100% reliable mechanism defined in the emacs-egui HTTP API.
-        if let Some(win) = web_sys::window() {
-            if let Ok(hash) = win.location().hash() {
-                let hash_clean = hash.trim_start_matches('#');
-                let mut session = None;
-                let mut port = None;
-                for part in hash_clean.split('&') {
-                    let mut kv = part.splitn(2, '=');
-                    if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
-                        if k == "session" {
-                            session = Some(v.to_string());
-                        } else if k == "port" {
-                            port = v.parse::<u16>().ok();
-                        }
-                    }
-                }
+        // 2. Non-blocking loopback fetch using parsed session params.
+        let params = parse_session_params();
+        let encoded_payload = js_sys::encode_uri_component(&payload_json);
+        let url = format!(
+            "http://127.0.0.1:{}/api/event?session={}&action={}&payload={}",
+            params.port, params.session_id, action, encoded_payload
+        );
 
-                if let (Some(sess), Some(p)) = (session, port) {
-                    let encoded_payload = js_sys::encode_uri_component(&payload_json);
-                    let url = format!(
-                        "http://127.0.0.1:{}/api/event?session={}&action={}&payload={}",
-                        p, sess, action, encoded_payload
-                    );
-                    
-                    wasm_bindgen_futures::spawn_local(async move {
-                        if let Some(win) = web_sys::window() {
-                            let _ = win.fetch_with_str(&url);
-                        }
-                    });
-                }
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(win) = web_sys::window() {
+                let _ = win.fetch_with_str(&url);
             }
-        }
+        });
     }
 }
 
@@ -256,7 +309,7 @@ pub fn bootstrap_app<A: EguiEmacsApp + 'static>(app: A, canvas_id: &str) -> Resu
 
     let web_options = eframe::WebOptions::default();
     let canvas_id = canvas_id.to_string();
-    
+
     wasm_bindgen_futures::spawn_local(async move {
         let document = web_sys::window()
             .and_then(|win| win.document())
@@ -278,4 +331,38 @@ pub fn bootstrap_app<A: EguiEmacsApp + 'static>(app: A, canvas_id: &str) -> Resu
     });
 
     Ok(())
+}
+
+/// High-level entry point that parses session parameters from the URL hash
+/// and bootstraps the app. Use this from your `#[wasm_bindgen]` entry point:
+///
+/// ```ignore
+/// #[wasm_bindgen]
+/// pub fn start_app(canvas_id: &str) -> Result<(), JsValue> {
+///     emacs_egui_sdk::launch(canvas_id, |session, port| MyApp::new(session, port))
+/// }
+/// ```
+///
+/// If your app doesn't need session/port, use [`launch_simple`] instead.
+#[cfg(target_arch = "wasm32")]
+pub fn launch<A, F>(canvas_id: &str, ctor: F) -> Result<(), JsValue>
+where
+    A: EguiEmacsApp + 'static,
+    F: FnOnce(SessionParams) -> A,
+{
+    let params = parse_session_params();
+    bootstrap_app(ctor(params), canvas_id)
+}
+
+/// Simplified entry point for apps that don't need session parameters:
+///
+/// ```ignore
+/// #[wasm_bindgen]
+/// pub fn start_app(canvas_id: &str) -> Result<(), JsValue> {
+///     emacs_egui_sdk::launch_simple(canvas_id, MyApp::new())
+/// }
+/// ```
+#[cfg(target_arch = "wasm32")]
+pub fn launch_simple<A: EguiEmacsApp + 'static>(canvas_id: &str, app: A) -> Result<(), JsValue> {
+    bootstrap_app(app, canvas_id)
 }

@@ -18,6 +18,9 @@
 (require 'json)
 (require 'url-util)
 
+(defconst emacs-egui-version "0.1.0"
+  "Version of the emacs-egui framework.")
+
 (defgroup emacs-egui nil
   "Generic GPU-accelerated egui host framework."
   :group 'tools
@@ -39,6 +42,38 @@ Keys are \"session-id:action\", value is callback function.")
 (defvar emacs-egui--sessions (make-hash-table :test 'equal)
   "Hash table of active session metadata.")
 
+(defvar emacs-egui--app-registry (make-hash-table :test 'equal)
+  "Hash table mapping app names to their UI directories.
+Populated by `emacs-egui-register-app'.")
+
+;; ---------------------------------------------------------------------------
+;; App Registration
+;; ---------------------------------------------------------------------------
+
+(defun emacs-egui-register-app (app-name ui-dir)
+  "Register APP-NAME with its UI-DIR (absolute path to the UI directory).
+Consumer packages call this at load time so the framework can locate their assets."
+  (puthash app-name (file-name-as-directory (expand-file-name ui-dir))
+           emacs-egui--app-registry))
+
+;; ---------------------------------------------------------------------------
+;; Payload Helpers
+;; ---------------------------------------------------------------------------
+
+(defun emacs-egui-get-field (payload key)
+  "Retrieve KEY from PAYLOAD, supporting both alist and plist formats.
+KEY should be a symbol (e.g. \\='filepath).  Works with both
+`json-read-from-string' alist output and Elisp plists."
+  (let* ((key-str (symbol-name key))
+         (clean-key (if (string-prefix-p ":" key-str)
+                        (substring key-str 1)
+                      key-str)))
+    (if (and payload (listp (car-safe payload)))
+        ;; alist
+        (cdr (assoc (intern clean-key) payload))
+      ;; plist
+      (plist-get payload (intern (concat ":" clean-key))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Local Asset Server & Secure File Gateway
 ;; ---------------------------------------------------------------------------
@@ -48,10 +83,12 @@ Keys are \"session-id:action\", value is callback function.")
   "Directory of this file, used to resolve application relative paths.")
 
 (defun emacs-egui--get-app-dir (app-name)
-  "Locate the base directory of a registered app by name."
-  ;; Assumes standard folder structure: /Users/randall/projects/<app-name>/renderer/
-  (expand-file-name (format "../../%s/renderer/" app-name)
-                    emacs-egui--dir))
+  "Locate the UI directory for APP-NAME.
+Checks the app registry first, then falls back to sibling directory convention."
+  (or (gethash app-name emacs-egui--app-registry)
+      (let ((fallback (expand-file-name (format "../../%s/ui/" app-name)
+                                         emacs-egui--dir)))
+        (and (file-directory-p fallback) fallback))))
 
 (defun emacs-egui--content-type (file)
   "Return Content-Type based on extension for FILE."
