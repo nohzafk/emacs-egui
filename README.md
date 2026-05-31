@@ -293,10 +293,22 @@ Create `lisp/my-emacs-app.el`:
                              default-directory))
     "Directory containing my-emacs-app lisp files.")
 
-  ;; Auto-load bundled emacs-egui from the submodule
-  (unless (featurep 'emacs-egui)
-    (add-to-list 'load-path
-                 (expand-file-name "../emacs-egui/lisp/" my-emacs-app--dir)))
+  ;; emacs-egui is not published to MELPA and is intentionally NOT declared in
+  ;; `Package-Requires': this package vendors it as a git submodule at the
+  ;; repository root, which is also required to build the WASM UI (the Rust SDK
+  ;; lives there), so the submodule is the single source of truth. If emacs-egui
+  ;; happens to be installed separately it will be on `load-path' -- but
+  ;; `featurep' can still be nil at byte-compile time, so we also check
+  ;; `locate-library'. Only when neither is found do we fall back to the bundled
+  ;; submodule copy, erroring if even that is absent.
+  (unless (or (featurep 'emacs-egui)
+              (locate-library "emacs-egui"))
+    (let ((egui-dir (expand-file-name "../emacs-egui/lisp/" my-emacs-app--dir)))
+      (unless (file-exists-p (expand-file-name "emacs-egui.el" egui-dir))
+        (error "my-emacs-app: emacs-egui not found on `load-path' and \
+no bundled copy under %s. Install emacs-egui, or clone submodules with: \
+git submodule update --init --recursive" egui-dir))
+      (add-to-list 'load-path egui-dir)))
   (require 'emacs-egui))
 
 ;; Version gate
@@ -413,23 +425,8 @@ my-app/
 
 **Multiple apps:** `(require 'emacs-egui)` is idempotent -- whichever app loads first provides it. Use `emacs-egui-version` to gate on minimum version.
 
-### Packaging and Autoloading (The Dependency Caveat)
-
-Because standard Emacs package managers (like `package.el`, Straight, or Elpaca) automatically activate packages by looking up their declared dependencies in public archives (e.g., `Package-Requires: ((emacs-egui "0.1.0"))`), local development checkouts that bundle `emacs-egui` as a Git submodule require special care:
-
-1. **Standard Activation Failures:** If `emacs-egui` is not published to public archives (like ELPA/MELPA), standard package activation will fail to satisfy the dependency and skip activating your package. This means your package's `;;;###autoload` cookies will **not** be registered at Emacs boot.
-2. **Recommended Configuration Pattern:** To support direct Git clones and local development configurations (like Doom Emacs or Emacs Hypervisor), instruct your users to bypass the package manager's activation pipeline by manually adding the `lisp/` folder to the `load-path` and loading the autoloads file:
-   ```elisp
-   (let ((dir (expand-file-name "~/projects/my-emacs-app/lisp")))
-     (when (file-directory-p dir)
-       (add-to-list 'load-path dir)
-       (load "my-emacs-app-autoloads" nil t)
-       (keymap-set global-map "C-c m a" #'my-emacs-app-open)))
-   ```
-   This pattern guarantees:
-   - Your package remains fully **lazy-loaded** (boosting startup performance).
-   - The robust `eval-and-compile` submodule block in your main `.el` file successfully resolves the nested Git submodule dependency at runtime.
-   - It completely bypasses built-in package manager dependency lookup issues.
+> [!TIP]
+> **Omit `emacs-egui` from `Package-Requires`:** Since `emacs-egui` is vendored as a submodule and is not published on public package archives (like MELPA), downstream packages should **not** include `emacs-egui` in their `Package-Requires` header. Simply declare standard requirements (e.g. `((emacs "29.1"))`) and let the dynamic `eval-and-compile` path setup in Step 5 resolve the submodule automatically at runtime.
 
 ---
 
