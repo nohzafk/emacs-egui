@@ -14,6 +14,7 @@ A framework for building GPU-accelerated [egui](https://github.com/emilk/egui) a
 | App | Description |
 |-----|-------------|
 | [emacs-parquet-explorer](https://github.com/nohzafk/emacs-parquet-explorer) | GPU-accelerated Parquet file viewer with virtual scrolling, search, filtering, and CSV export |
+| [emacs-workspace-hud](https://github.com/nohzafk/emacs-workspace-hud)|A floating workspace status HUD for Emacs, showing Git, LSP, and diagnostic state in a WebAssembly-powered egui card.|
 
 ---
 
@@ -343,6 +344,7 @@ git submodule update --init --recursive" egui-dir))
 ```
 
 Users only need one `load-path` entry — the bundled submodule is discovered automatically:
+
 ```elisp
 (add-to-list 'load-path "/path/to/my-emacs-app/lisp")
 ```
