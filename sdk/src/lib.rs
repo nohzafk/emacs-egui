@@ -1,32 +1,56 @@
-use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
-use wasm_bindgen::prelude::*;
+//! The emacs-egui SDK: what an egui application is written against, whichever
+//! backend draws it.
+//!
+//! An application implements [`EguiEmacsApp`] once. Two backends host it:
+//!
+//! - **web** (cargo feature `web`): the application is compiled to
+//!   WebAssembly and runs under eframe in an `xwidget-webkit` page. Emacs
+//!   pushes JSON through the JavaScript entry points `egui_push_state` and
+//!   `egui_push_theme`, and [`emacs_post_message`] answers over the Elisp
+//!   server's loopback route.
+//! - **native**: the `emacs-egui-native` crate links the application into a
+//!   dynamic module and renders it with Metal in a view that Emacs places. It
+//!   installs the route for [`emacs_post_message`] with [`set_message_sink`].
+//!
+//! Both drive the application through an [`AppHost`], so an application sees
+//! the same state type on either: the web backend parses the pushed JSON into
+//! a [`serde_json::Value`], the native one converts the pushed Lisp plist into
+//! the same `Value`, and [`AppHost::decode`] deserializes it into
+//! [`EguiEmacsApp::State`].
 
-// Re-export key dependencies so consumer crates don't need to declare them.
+use serde::{Deserialize, Deserializer, Serialize};
+use std::sync::OnceLock;
+
+// Re-export key dependencies so application crates need not declare them.
 pub use egui;
-pub use eframe;
-pub use wasm_bindgen;
-pub use wasm_bindgen_futures;
-pub use js_sys;
 pub use serde;
 pub use serde_json;
 
-lazy_static::lazy_static! {
-    static ref REPAINT_SIGNAL: Mutex<Option<egui::Context>> = Mutex::new(None);
-    static ref STATE_MESSAGE_QUEUE: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    static ref THEME_MESSAGE_QUEUE: Mutex<Option<ThemeColors>> = Mutex::new(None);
-}
+#[cfg(feature = "web")]
+mod web;
+#[cfg(feature = "web")]
+pub use web::*;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// The Emacs theme a widget follows: the frame's default face, resolved on
+/// the frame that displays the widget.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ThemeColors {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub bg: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub fg: String,
     #[serde(rename = "font-size", default)]
     pub font_size: Option<f32>,
-    #[serde(rename = "surface-bg", default)]
+    #[serde(rename = "surface-bg", default, deserialize_with = "null_as_empty")]
     pub surface_bg: String,
+    #[serde(rename = "font-family", default)]
+    pub font_family: Option<String>,
+}
+
+/// A JSON `null`, which a page sends for a parameter its URL lacks, reads as
+/// an empty string instead of failing the whole theme.
+fn null_as_empty<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 impl Default for ThemeColors {
@@ -36,151 +60,126 @@ impl Default for ThemeColors {
             fg: "#e6ebff".to_string(),
             font_size: None,
             surface_bg: String::new(),
+            font_family: None,
         }
     }
 }
 
-/// Session parameters parsed from the URL hash fragment.
-/// The Elisp runtime embeds these when creating the xwidget session.
-#[derive(Clone, Debug)]
-pub struct SessionParams {
-    pub session_id: String,
-    pub port: u16,
-}
-
-/// Parse session parameters (session ID and server port) from the URL hash fragment.
-/// Returns defaults if parsing fails or running outside a browser.
-pub fn parse_session_params() -> SessionParams {
-    let (mut session_id, mut port) = ("default-session".to_string(), 8080u16);
-
-    if let Some(win) = web_sys::window() {
-        if let Ok(hash) = win.location().hash() {
-            let hash_clean = hash.trim_start_matches('#');
-            if let Ok(params) = web_sys::UrlSearchParams::new_with_str(hash_clean) {
-                if let Some(s) = params.get("session") {
-                    session_id = s;
-                }
-                if let Some(p) = params.get("port") {
-                    if let Ok(parsed) = p.parse::<u16>() {
-                        port = parsed;
-                    }
-                }
-            }
-        }
-    }
-
-    SessionParams { session_id, port }
-}
-
-/// Build the URL to fetch a local file through the Elisp HTTP server's file gateway.
-///
-/// The Elisp server exposes `/api/file?path=<encoded>` to stream local files
-/// as raw bytes into the WASM sandbox.
-pub fn file_url(path: &str) -> String {
-    let params = parse_session_params();
-    let encoded = js_sys::encode_uri_component(path);
-    format!("http://127.0.0.1:{}/api/file?path={}", params.port, encoded)
-}
-
-/// Fetch raw bytes from a URL. Convenience wrapper around the browser fetch API.
-///
-/// Commonly used with [`file_url`] to load local files through the Elisp server:
-/// ```ignore
-/// let url = emacs_egui_sdk::file_url("/path/to/data.parquet");
-/// let bytes = emacs_egui_sdk::fetch_bytes(&url).await?;
-/// ```
-pub async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
-    use wasm_bindgen::JsCast;
-    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
-    let resp_value = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url)).await?;
-    let resp: web_sys::Response = resp_value.dyn_into()?;
-
-    if !resp.ok() {
-        return Err(JsValue::from_str(&format!("HTTP status {}", resp.status())));
-    }
-
-    let array_buffer_value = wasm_bindgen_futures::JsFuture::from(resp.array_buffer()?).await?;
-    let array_buffer: js_sys::ArrayBuffer = array_buffer_value.dyn_into()?;
-    let typed_array = js_sys::Uint8Array::new(&array_buffer);
-
-    let mut bytes = vec![0; typed_array.length() as usize];
-    typed_array.copy_to(&mut bytes);
-    Ok(bytes)
-}
-
-/// The EguiEmacsApp trait. Applications built with the emacs-egui framework
-/// implement this trait instead of raw eframe::App.
+/// An application hosted in Emacs.
 pub trait EguiEmacsApp {
+    /// The state Emacs pushes: a plist on the Emacs side, deserialized from
+    /// the JSON value it maps to (keys without their colon).
     type State: serde::de::DeserializeOwned;
 
-    /// Called whenever Emacs pushes a new state payload.
+    /// Called with each state Emacs pushes, before the frame that shows it.
     fn on_state_update(&mut self, state: Self::State);
 
-    /// Called whenever Emacs pushes a theme update.
+    /// Called when Emacs pushes a theme, after the SDK has applied it to the
+    /// context's style ([`apply_theme_to_ctx`]).
     fn on_theme_update(&mut self, theme: ThemeColors);
 
-    /// Draws the interface (same as standard eframe::App).
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame);
+    /// Draw one frame into `ui`, the root `Ui` that covers the whole widget,
+    /// with no margin or background. Its context is `ui.ctx()`.
+    fn update(&mut self, ui: &mut egui::Ui);
 }
 
-/// Core wrapper struct that implements standard eframe::App and maps standard
-/// message queues to the generic EguiEmacsApp implementation.
-pub struct EguiEmacsAppWrapper<A: EguiEmacsApp> {
+/// What one frame applied, for a backend that reports the frame that showed
+/// a push.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Applied {
+    pub state: bool,
+    pub theme: bool,
+}
+
+/// One application as a backend drives it: the state and theme pushed to it,
+/// counted, and its frames.
+pub struct AppHost<A: EguiEmacsApp> {
     app: A,
-    current_theme: ThemeColors,
+    theme: ThemeColors,
+    pending_theme: Option<ThemeColors>,
+    applied: Applied,
+    pushes: u64,
+    themes: u64,
 }
 
-impl<A: EguiEmacsApp> EguiEmacsAppWrapper<A> {
+impl<A: EguiEmacsApp> AppHost<A> {
     pub fn new(app: A) -> Self {
         Self {
             app,
-            current_theme: ThemeColors::default(),
+            theme: ThemeColors::default(),
+            pending_theme: None,
+            applied: Applied::default(),
+            pushes: 0,
+            themes: 0,
         }
+    }
+
+    /// Deserialize a pushed value into the application's state type; an
+    /// error names where in the value it failed, as `sections[0].priority`.
+    pub fn decode(value: serde_json::Value) -> Result<A::State, String> {
+        serde_path_to_error::deserialize(value).map_err(|e| {
+            let at = e.path().to_string();
+            if at == "." {
+                e.into_inner().to_string()
+            } else {
+                format!("{}, at {at}", e.into_inner())
+            }
+        })
+    }
+
+    /// Hand a state to the application now.
+    pub fn push_state(&mut self, state: A::State) {
+        self.app.on_state_update(state);
+        self.pushes += 1;
+        self.applied.state = true;
+    }
+
+    /// Keep a theme for the next frame, which applies it before drawing.
+    pub fn push_theme(&mut self, theme: ThemeColors) {
+        self.pending_theme = Some(theme);
+        self.themes += 1;
+    }
+
+    /// Run one frame: apply a pending theme, then let the application draw.
+    pub fn frame(&mut self, ui: &mut egui::Ui) -> Applied {
+        if let Some(theme) = self.pending_theme.take() {
+            apply_theme_to_ctx(ui.ctx(), &theme);
+            // The root `Ui` copied the style when the pass began; give it the
+            // new one, so this frame already draws in the new theme.
+            ui.set_style(ui.ctx().global_style());
+            self.theme = theme.clone();
+            self.app.on_theme_update(theme);
+            self.applied.theme = true;
+        }
+        self.app.update(ui);
+        std::mem::take(&mut self.applied)
+    }
+
+    /// The theme last applied.
+    pub fn theme(&self) -> &ThemeColors {
+        &self.theme
+    }
+
+    /// How many states have been pushed.
+    pub fn pushes(&self) -> u64 {
+        self.pushes
+    }
+
+    /// How many themes have been pushed.
+    pub fn themes(&self) -> u64 {
+        self.themes
+    }
+
+    pub fn app(&self) -> &A {
+        &self.app
+    }
+
+    pub fn app_mut(&mut self) -> &mut A {
+        &mut self.app
     }
 }
 
-impl<A: EguiEmacsApp> eframe::App for EguiEmacsAppWrapper<A> {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
-    }
-
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // Set context for repaints
-        if let Ok(mut signal) = REPAINT_SIGNAL.lock() {
-            if signal.is_none() {
-                *signal = Some(ctx.clone());
-            }
-        }
-
-        // 1. Drain incoming Lisp -> WASM state updates
-        if let Ok(mut queue) = STATE_MESSAGE_QUEUE.lock() {
-            for state_json in queue.drain(..) {
-                if let Ok(state) = serde_json::from_str::<A::State>(&state_json) {
-                    self.app.on_state_update(state);
-                }
-            }
-        }
-
-        // 2. Drain incoming Lisp -> WASM theme updates
-        let mut theme_updated = false;
-        if let Ok(mut opt) = THEME_MESSAGE_QUEUE.lock() {
-            if let Some(theme) = opt.take() {
-                self.current_theme = theme;
-                theme_updated = true;
-            }
-        }
-
-        if theme_updated {
-            apply_theme_to_ctx(ctx, &self.current_theme);
-            self.app.on_theme_update(self.current_theme.clone());
-        }
-
-        // 3. Delegate to user application
-        self.app.update(ctx, frame);
-    }
-}
-
-/// Helper to parse a hex color into an egui Color32
+/// Parse `#rrggbb` (anything after the first six digits is ignored).
 pub fn parse_hex_color(hex: &str) -> Option<egui::Color32> {
     let hex = hex.trim_start_matches('#');
     if hex.len() >= 6 {
@@ -197,14 +196,16 @@ fn luminance(c: egui::Color32) -> u8 {
     ((c.r() as u32 * 299 + c.g() as u32 * 587 + c.b() as u32 * 114) / 1000) as u8
 }
 
-fn apply_theme_to_ctx(ctx: &egui::Context, theme: &ThemeColors) {
+/// Map the Emacs theme onto the context's style: dark or light visuals by
+/// the background's luminance, the background as panel and window fill, the
+/// foreground as text, and one monospace text size derived from the face.
+pub fn apply_theme_to_ctx(ctx: &egui::Context, theme: &ThemeColors) {
     let bg = parse_hex_color(&theme.bg).unwrap_or(egui::Color32::from_rgb(12, 12, 16));
     let fg = parse_hex_color(&theme.fg).unwrap_or(egui::Color32::from_rgb(230, 235, 255));
     let is_dark = luminance(bg) < 128;
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
 
-    // Setup general spacing & sizing
     let text_size = theme
         .font_size
         .map(|sz| sz * 0.76)
@@ -213,13 +214,11 @@ fn apply_theme_to_ctx(ctx: &egui::Context, theme: &ThemeColors) {
 
     style.override_text_style = Some(egui::TextStyle::Body);
 
-    // Set custom fonts sizes
     for (_, font_id) in style.text_styles.iter_mut() {
         font_id.size = text_size;
         font_id.family = egui::FontFamily::Monospace;
     }
 
-    // Configure visuals
     let mut visuals = if is_dark {
         egui::Visuals::dark()
     } else {
@@ -232,137 +231,35 @@ fn apply_theme_to_ctx(ctx: &egui::Context, theme: &ThemeColors) {
     visuals.panel_fill = parse_hex_color(&theme.surface_bg).unwrap_or(bg);
 
     style.visuals = visuals;
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
-/// Posts an action message back to Emacs via two channels:
-/// 1. Mutates `document.title` (fallback for macOS title-change hook)
-/// 2. Non-blocking loopback HTTP fetch to the Elisp server
+/// Where [`emacs_post_message`] sends a message when a backend other than the
+/// web one hosts the application.
+pub type MessageSink = fn(action: &str, payload: serde_json::Value);
+
+static MESSAGE_SINK: OnceLock<MessageSink> = OnceLock::new();
+
+/// Route [`emacs_post_message`] to `sink`. A backend calls this once; false
+/// if a sink was already set.
+pub fn set_message_sink(sink: MessageSink) -> bool {
+    MESSAGE_SINK.set(sink).is_ok()
+}
+
+/// Send an action and its payload to Emacs, where the host's function for
+/// that action receives the payload as a plist.
+///
+/// The native backend's sink delivers it through the module's pipe process;
+/// without a sink, the web backend fetches the Elisp server's loopback route.
+/// Without either, the message is dropped.
 pub fn emacs_post_message<T: Serialize>(action: &str, payload: T) {
-    if let Ok(payload_json) = serde_json::to_string(&payload) {
-        // 1. Mutate document.title as a fallback / visual hook indicator
-        let msg = serde_json::json!({
-            "action": action,
-            "payload": payload
-        });
-        if let Ok(json_str) = serde_json::to_string(&msg) {
-            if let Some(win) = web_sys::window() {
-                if let Some(doc) = win.document() {
-                    doc.set_title(&json_str);
-                }
-            }
-        }
-
-        // 2. Non-blocking loopback fetch using parsed session params.
-        let params = parse_session_params();
-        let encoded_payload = js_sys::encode_uri_component(&payload_json);
-        let url = format!(
-            "http://127.0.0.1:{}/api/event?session={}&action={}&payload={}",
-            params.port, params.session_id, action, encoded_payload
-        );
-
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Some(win) = web_sys::window() {
-                let _ = win.fetch_with_str(&url);
-            }
-        });
+    let Ok(payload) = serde_json::to_value(&payload) else {
+        return;
+    };
+    if let Some(sink) = MESSAGE_SINK.get() {
+        sink(action, payload);
+        return;
     }
-}
-
-// ---------------------------------------------------------------------------
-// JS-Exposed WASM Bindings
-// ---------------------------------------------------------------------------
-
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen]
-pub fn egui_push_state(json: &str) {
-    if let Ok(mut queue) = STATE_MESSAGE_QUEUE.lock() {
-        queue.push(json.to_string());
-    }
-    // Trigger repaint immediately
-    if let Ok(signal) = REPAINT_SIGNAL.lock() {
-        if let Some(ctx) = &*signal {
-            ctx.request_repaint();
-        }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen]
-pub fn egui_push_theme(json: &str) {
-    if let Ok(theme) = serde_json::from_str::<ThemeColors>(json) {
-        if let Ok(mut guard) = THEME_MESSAGE_QUEUE.lock() {
-            *guard = Some(theme);
-        }
-        if let Ok(signal) = REPAINT_SIGNAL.lock() {
-            if let Some(ctx) = &*signal {
-                ctx.request_repaint();
-            }
-        }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-pub fn bootstrap_app<A: EguiEmacsApp + 'static>(app: A, canvas_id: &str) -> Result<(), JsValue> {
-    // Redirect panics to browser console
-    console_error_panic_hook::set_once();
-
-    let web_options = eframe::WebOptions::default();
-    let canvas_id = canvas_id.to_string();
-
-    wasm_bindgen_futures::spawn_local(async move {
-        let document = web_sys::window()
-            .and_then(|win| win.document())
-            .expect("Failed to get document");
-        let canvas = document
-            .get_element_by_id(&canvas_id)
-            .expect("Failed to get canvas")
-            .dyn_into::<web_sys::HtmlCanvasElement>()
-            .expect("Failed to cast to canvas");
-
-        let runner = eframe::WebRunner::new();
-        runner.start(
-            canvas,
-            web_options,
-            Box::new(|_cc| Ok(Box::new(EguiEmacsAppWrapper::new(app)))),
-        )
-        .await
-        .expect("failed to start eframe");
-    });
-
-    Ok(())
-}
-
-/// High-level entry point that parses session parameters from the URL hash
-/// and bootstraps the app. Use this from your `#[wasm_bindgen]` entry point:
-///
-/// ```ignore
-/// #[wasm_bindgen]
-/// pub fn start_app(canvas_id: &str) -> Result<(), JsValue> {
-///     emacs_egui_sdk::launch(canvas_id, |session, port| MyApp::new(session, port))
-/// }
-/// ```
-///
-/// If your app doesn't need session/port, use [`launch_simple`] instead.
-#[cfg(target_arch = "wasm32")]
-pub fn launch<A, F>(canvas_id: &str, ctor: F) -> Result<(), JsValue>
-where
-    A: EguiEmacsApp + 'static,
-    F: FnOnce(SessionParams) -> A,
-{
-    let params = parse_session_params();
-    bootstrap_app(ctor(params), canvas_id)
-}
-
-/// Simplified entry point for apps that don't need session parameters:
-///
-/// ```ignore
-/// #[wasm_bindgen]
-/// pub fn start_app(canvas_id: &str) -> Result<(), JsValue> {
-///     emacs_egui_sdk::launch_simple(canvas_id, MyApp::new())
-/// }
-/// ```
-#[cfg(target_arch = "wasm32")]
-pub fn launch_simple<A: EguiEmacsApp + 'static>(canvas_id: &str, app: A) -> Result<(), JsValue> {
-    bootstrap_app(app, canvas_id)
+    #[cfg(feature = "web")]
+    web::post_message(action, &payload);
 }

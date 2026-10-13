@@ -1,17 +1,20 @@
 [package]
 name = "emacs-egui-native"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Native backend of emacs-egui: a dynamic module that renders egui with Metal into an NSView inside Emacs"
+description = "Native backend of emacs-egui: renders an egui application with Metal into an NSView that Emacs places, from a dynamic module"
 license = "MIT"
 publish = false
 
+# A library. An application crate builds as a `cdylib`, depends on this crate
+# and on emacs-egui-sdk, and exports its module with `export_app!`.
 [lib]
-crate-type = ["cdylib"]
 
 [dependencies]
+emacs-egui-sdk = { path = "../sdk" }
 emacs = { version = "0.23", features = ["emacs-28"] }
 anyhow = "1"
+serde_json = "1"
 egui = "0.36"
 egui-wgpu = "0.36"
 pollster = "1"
@@ -21,7 +24,9 @@ objc2-app-kit = "0.3"
 objc2-quartz-core = "0.3"
 dispatch2 = "0.3"
 block2 = "0.6"
-raw-window-handle = "0.6"
+
+[workspace]
+members = [".", "demo"]
 
 [profile.release]
 opt-level = 3
