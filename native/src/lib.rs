@@ -20,7 +20,7 @@
 //! | `-push-theme HANDLE THEME` | hand THEME, a plist, to the view |
 //! | `-focus HANDLE`, `-unfocus HANDLE` | let the view take keys, or give them back |
 //! | `-id`, `-frames`, `-info` | the view's id, frame count and a plist about it |
-//! | `-panic`, `-test-click`, `-test-post-key`, `-test-magnify`, `-test-scroll`, `-test-counts`, `-test-deactivate` | test entries |
+//! | `-panic`, `-test-click`, `-test-mouse`, `-test-post-key`, `-test-magnify`, `-test-scroll`, `-test-counts`, `-test-deactivate` | test entries |
 //!
 //! The view is placed by Emacs, not by this module: the handle is a
 //! `user-ptr` whose pointer is the view, ready for `(make-xwidget 'native

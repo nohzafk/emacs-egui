@@ -78,7 +78,7 @@ pub unsafe fn module_init<M: Module>(runtime: *mut emacs_runtime) -> c_int {
 
 fn define_functions<M: Module>(env: &Env) -> Result<()> {
     let p = M::PREFIX;
-    let defs: [(&str, LispFn, Range<usize>, &str); 17] = [
+    let defs: [(&str, LispFn, Range<usize>, &str); 19] = [
         (
             "open-channel",
             open_channel::<M>,
@@ -179,6 +179,18 @@ fn define_functions<M: Module>(env: &Env) -> Result<()> {
              view's window; CTRL non-nil adds Control.\n\n(fn HANDLE CHARS &optional CTRL)",
         ),
         (
+            "test-mouse",
+            test_mouse::<M>,
+            4..5,
+            "Test entry: post one left-button event of KIND (`down', `drag' or `up')\n\
+             at X, Y in HANDLE's view, in points.  Without VIA-PID, to the\n\
+             application's event queue, addressed to the view's window; with\n\
+             VIA-PID, through the window server to this process (CGEventPostToPid),\n\
+             which routes it by screen location as it does a real mouse's, without\n\
+             moving the pointer.  Return the point in window coordinates.\n\n\
+             (fn HANDLE KIND X Y &optional VIA-PID)",
+        ),
+        (
             "test-magnify",
             test_magnify::<M>,
             2..3,
@@ -197,6 +209,16 @@ fn define_functions<M: Module>(env: &Env) -> Result<()> {
              HANDLE's view, posted or, with DIRECT, handed to `scrollWheel:'.  Return\n\
              (TYPE DELTA-Y WINDOW-NUMBER) of the event made.\n\n\
              (fn HANDLE DY &optional DIRECT)",
+        ),
+        (
+            "test-watch-mouse",
+            test_watch_mouse::<M>,
+            0..0,
+            "Test entry: count the left-button events the application dequeues.\n\n\
+             The first call installs a local event monitor; every call returns\n\
+             (:downs N :drags N :ups N :last-window N :last-hit CLASS), where\n\
+             LAST-HIT names the class of the view the event's window hit-tests\n\
+             at the last event's location, the view AppKit would send it to.",
         ),
         (
             "test-counts",
@@ -573,6 +595,13 @@ fn info<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
             env.list((egui_w as f64, egui_h as f64))?,
             env.intern(":first-responder")?,
             first_responder,
+            env.intern(":mouse")?,
+            env.list((
+                s.mouse[0].load(Ordering::SeqCst) as i64,
+                s.mouse[1].load(Ordering::SeqCst) as i64,
+                s.mouse[2].load(Ordering::SeqCst) as i64,
+                s.mouse[3].load(Ordering::SeqCst) as i64,
+            ))?,
             env.intern(":key-window")?,
             key_window.into_lisp(env)?,
         ];
@@ -650,6 +679,63 @@ fn test_click<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
     })
 }
 
+fn test_mouse<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
+    guard(|| {
+        let mtm = main_thread()?;
+        let args = env.args();
+        let view = view_of::<M>(args[0])?;
+        let kind = env.call("symbol-name", (args[1],))?.into_rust::<String>()?;
+        let (x, y) = (number(env, args[2])?, number(env, args[3])?);
+        let nsview: &NSView = &view;
+        let window = nsview
+            .window()
+            .ok_or_else(|| anyhow::anyhow!("view has no window"))?;
+        let (kind, pressure, cg_kind) = match kind.as_str() {
+            "down" => (NSEventType::LeftMouseDown, 1.0, 1),
+            "drag" => (NSEventType::LeftMouseDragged, 1.0, 6),
+            "up" => (NSEventType::LeftMouseUp, 0.0, 2),
+            other => return Err(anyhow::anyhow!("KIND is down, drag or up, not {other}").into()),
+        };
+        let p = nsview.convertPoint_toView(NSPoint::new(x, y), None);
+        if args.get(4).is_some_and(|v| v.is_not_nil()) {
+            let on_screen = window.convertPointToScreen(p);
+            let main_height = NSScreen::screens(mtm)
+                .iter()
+                .next()
+                .map(|s| s.frame().size.height)
+                .unwrap_or(0.0);
+            let at = CGPoint {
+                x: on_screen.x,
+                y: main_height - on_screen.y,
+            };
+            unsafe {
+                // kCGMouseButtonLeft
+                let cg = CGEventCreateMouseEvent(ptr::null(), cg_kind, at, 0);
+                if cg.is_null() {
+                    return Err(anyhow::anyhow!("CoreGraphics made no event").into());
+                }
+                CGEventPostToPid(std::process::id() as i32, cg);
+                CFRelease(cg);
+            }
+            return env.list((p.x, p.y));
+        }
+        let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+            kind,
+            p,
+            NSEventModifierFlags::empty(),
+            NSProcessInfo::processInfo().systemUptime(),
+            window.windowNumber(),
+            None,
+            0,
+            1,
+            pressure,
+        )
+        .ok_or_else(|| anyhow::anyhow!("cannot make a mouse event"))?;
+        NSApplication::sharedApplication(mtm).postEvent_atStart(&event, false);
+        env.list((p.x, p.y))
+    })
+}
+
 fn test_post_key<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
     guard(|| {
         let mtm = main_thread()?;
@@ -716,6 +802,13 @@ struct CGPoint {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGEventCreate(source: *const c_void) -> *mut c_void;
+    fn CGEventCreateMouseEvent(
+        source: *const c_void,
+        kind: u32,
+        location: CGPoint,
+        button: u32,
+    ) -> *mut c_void;
+    fn CGEventPostToPid(pid: i32, event: *mut c_void);
     fn CGEventCreateScrollWheelEvent2(
         source: *const c_void,
         units: u32,
@@ -895,6 +988,80 @@ fn test_scroll<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
             event.r#type().0 as i64,
             event.scrollingDeltaY(),
             event.windowNumber() as i64,
+        ))
+    })
+}
+
+thread_local! {
+    /// What `-test-watch-mouse`'s monitor counted: downs, drags, ups, the last
+    /// event's window number and the class of the view it hit. Main thread.
+    static MOUSE_WATCH: std::cell::RefCell<Option<(Retained<objc2::runtime::AnyObject>, [i64; 4], String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn test_watch_mouse<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
+    guard(|| {
+        let _ = main_thread()?;
+        MOUSE_WATCH.with(|w| {
+            if w.borrow().is_some() {
+                return;
+            }
+            let block = block2::RcBlock::new(|event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
+                let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    // SAFETY: AppKit passes a live event for the call.
+                    let ev = unsafe { event.as_ref() };
+                    let slot = match ev.r#type() {
+                        NSEventType::LeftMouseDown => 0,
+                        NSEventType::LeftMouseDragged => 1,
+                        NSEventType::LeftMouseUp => 2,
+                        _ => return,
+                    };
+                    let hit = ev
+                        .window(MainThreadMarker::new().expect("a monitor runs on the main thread"))
+                        .and_then(|win| {
+                            let content = win.contentView()?;
+                            let sup = unsafe { content.superview() }.unwrap_or(content);
+                            let p = sup.convertPoint_fromView(ev.locationInWindow(), None);
+                            sup.hitTest(p)
+                        })
+                        .map(|v| v.class().name().to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "none".to_string());
+                    MOUSE_WATCH.with(|w| {
+                        if let Some((_, counts, last)) = w.borrow_mut().as_mut() {
+                            counts[slot] += 1;
+                            counts[3] = ev.windowNumber() as i64;
+                            *last = hit;
+                        }
+                    });
+                }));
+                event.as_ptr()
+            });
+            let mask = objc2_app_kit::NSEventMask::LeftMouseDown
+                | objc2_app_kit::NSEventMask::LeftMouseDragged
+                | objc2_app_kit::NSEventMask::LeftMouseUp;
+            if let Some(monitor) =
+                unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &block) }
+            {
+                *w.borrow_mut() = Some((monitor, [0; 4], String::new()));
+            }
+        });
+        let (counts, last) = MOUSE_WATCH.with(|w| {
+            w.borrow()
+                .as_ref()
+                .map(|(_, c, l)| (*c, l.clone()))
+                .unwrap_or_default()
+        });
+        env.list((
+            env.intern(":downs")?,
+            counts[0],
+            env.intern(":drags")?,
+            counts[1],
+            env.intern(":ups")?,
+            counts[2],
+            env.intern(":last-window")?,
+            counts[3],
+            env.intern(":last-hit")?,
+            last,
         ))
     })
 }

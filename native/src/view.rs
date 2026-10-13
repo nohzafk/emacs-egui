@@ -131,6 +131,7 @@ fn pointer_button<V: ViewClass>(
 /// the Emacs window the widget is in. Then the view takes the keys, which it
 /// passes on to Emacs unless focused.
 pub fn mouse_down<V: ViewClass>(this: &V, event: &NSEvent) {
+    this.ivars().shared.mouse[0].fetch_add(1, Ordering::SeqCst);
     pointer_button(this, event, egui::PointerButton::Primary, true);
     let view: &NSView = this;
     if let Some(emacs) = emacs_view(view) {
@@ -144,6 +145,7 @@ pub fn mouse_down<V: ViewClass>(this: &V, event: &NSEvent) {
 }
 
 pub fn mouse_up<V: ViewClass>(this: &V, event: &NSEvent) {
+    this.ivars().shared.mouse[2].fetch_add(1, Ordering::SeqCst);
     pointer_button(this, event, egui::PointerButton::Primary, false);
     if let Some(emacs) = emacs_view(this) {
         unsafe {
@@ -161,6 +163,8 @@ pub fn right_mouse_up<V: ViewClass>(this: &V, event: &NSEvent) {
 }
 
 pub fn mouse_moved<V: ViewClass>(this: &V, event: &NSEvent) {
+    let dragged = event.r#type() == NSEventType::LeftMouseDragged;
+    this.ivars().shared.mouse[if dragged { 1 } else { 3 }].fetch_add(1, Ordering::SeqCst);
     let pos = local_pos(this, event);
     this.ivars()
         .shared

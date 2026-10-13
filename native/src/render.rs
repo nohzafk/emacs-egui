@@ -135,6 +135,9 @@ pub(crate) struct Shared {
     pub(crate) resume_ms: Mutex<Option<f64>>,
     /// What the application published for `-info` (`current::set_info`).
     pub(crate) app_info: Mutex<Vec<(String, serde_json::Value)>>,
+    /// Mouse events the view's methods received, for `-info`: left-button
+    /// downs, drags and ups, and moves with no button.
+    pub(crate) mouse: [AtomicU64; 4],
     /// Rectangles the application named for `-test-click`.
     pub(crate) click_targets: Mutex<Vec<(String, egui::Rect)>>,
 }
@@ -174,6 +177,7 @@ impl Shared {
             pause_ms: Mutex::new(None),
             resume_ms: Mutex::new(None),
             app_info: Mutex::new(Vec::new()),
+            mouse: Default::default(),
             click_targets: Mutex::new(Vec::new()),
         }
     }
