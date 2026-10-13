@@ -239,11 +239,38 @@ Checks the app registry first, then falls back to sibling directory convention."
 ;; Custom Theme Sync
 ;; ---------------------------------------------------------------------------
 
-(defun emacs-egui--theme-payload ()
-  "Return active theme color data for standard default face."
-  (let* ((bg (face-background 'default nil 'default))
-         (fg (face-foreground 'default nil 'default))
-         (height (face-attribute 'default :height nil 'default))
+(defun emacs-egui--rgb-hex (color frame)
+  "Resolve COLOR on FRAME to validated 8-bit RGB hex.
+NS stores face pixels by truncating component * 255; match that for high
+precision colors.  Other displays use nearest 8-bit color values."
+  (when (and (stringp color)
+             (not (string-prefix-p "unspecified" color)))
+    (when-let* ((rgb (ignore-errors (color-values color frame))))
+      (let ((quantize (if (eq (framep frame) 'ns) #'floor #'round)))
+        (apply #'format "#%02x%02x%02x"
+               (mapcar (lambda (v) (funcall quantize (/ v 257.0))) rgb))))))
+
+(defun emacs-egui--session-frame (session)
+  "Return the displaying frame of SESSION, not an unrelated selected frame."
+  (let* ((buf (plist-get session :buffer))
+         (w (and (buffer-live-p buf) (get-buffer-window buf t)))
+         (frame (plist-get session :frame)))
+    (cond (w (window-frame w))
+          ((frame-live-p frame) frame)
+          (t (selected-frame)))))
+
+(defun emacs-egui--theme-payload (&optional frame)
+  "Return validated theme colors for FRAME's default face.
+Invalid face values fall back to that frame's actual color parameters, never
+an unrelated hard-coded dark palette.  Fail explicitly if neither resolves."
+  (setq frame (or frame (selected-frame)))
+  (let* ((bg (or (emacs-egui--rgb-hex (face-background 'default frame 'default) frame)
+                 (emacs-egui--rgb-hex (frame-parameter frame 'background-color) frame)
+                 (error "No valid background on widget frame")))
+         (fg (or (emacs-egui--rgb-hex (face-foreground 'default frame 'default) frame)
+                 (emacs-egui--rgb-hex (frame-parameter frame 'foreground-color) frame)
+                 (error "No valid foreground on widget frame")))
+         (height (face-attribute 'default :height frame 'default))
          (font-size
           (cond
            ((integerp height) (/ height 10.0))
@@ -256,7 +283,8 @@ Checks the app registry first, then falls back to sibling directory convention."
 
 (defun emacs-egui--url-with-theme (app-name session-id)
   "Build the boot URL for APP-NAME incorporating theme parameters."
-  (let* ((theme (emacs-egui--theme-payload))
+  (let* ((session (gethash session-id emacs-egui--sessions))
+         (theme (emacs-egui--theme-payload (emacs-egui--session-frame session)))
          (bg (plist-get theme :bg))
          (fg (plist-get theme :fg))
          (font-size (plist-get theme :font-size)))
@@ -286,7 +314,7 @@ Checks the app registry first, then falls back to sibling directory convention."
   "Push active Emacs default face colors to the active SESSION."
   (let ((xwidget (plist-get session :xwidget)))
     (when (and xwidget (xwidget-live-p xwidget))
-      (let* ((json-str (json-encode (emacs-egui--theme-payload)))
+      (let* ((json-str (json-encode (emacs-egui--theme-payload (emacs-egui--session-frame session))))
              (script (format "if (window.egui_push_theme) { window.egui_push_theme(%S); } else if (window.eguiPushTheme) { window.eguiPushTheme(%S); }"
                              json-str json-str)))
         (xwidget-webkit-execute-script xwidget script)))))
