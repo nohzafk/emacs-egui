@@ -1,0 +1,24 @@
+[package]
+name = "emacs-egui-raster"
+version = "0.1.0"
+edition = "2021"
+description = "Raster backend of emacs-egui: a dynamic module that renders SVG to PNG with resvg, so Emacs shows the same image whatever SVG engine it was built with"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+emacs = { version = "0.23", features = ["emacs-28"] }
+resvg = "0.48.1"
+usvg = "0.48.1"
+tiny-skia = "0.12.0"
+fontdb = "0.24.0"
+png = "0.18.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+panic = "unwind"
