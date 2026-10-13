@@ -1,0 +1,29 @@
+[package]
+name = "emacs-egui-native"
+version = "0.1.0"
+edition = "2021"
+description = "Native backend of emacs-egui: a dynamic module that renders egui with Metal into an NSView inside Emacs"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+emacs = { version = "0.23", features = ["emacs-28"] }
+anyhow = "1"
+egui = "0.36"
+egui-wgpu = "0.36"
+pollster = "1"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-quartz-core = "0.3"
+dispatch2 = "0.3"
+raw-window-handle = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+panic = "unwind"
