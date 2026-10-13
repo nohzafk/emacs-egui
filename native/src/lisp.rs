@@ -78,7 +78,7 @@ pub unsafe fn module_init<M: Module>(runtime: *mut emacs_runtime) -> c_int {
 
 fn define_functions<M: Module>(env: &Env) -> Result<()> {
     let p = M::PREFIX;
-    let defs: [(&str, LispFn, Range<usize>, &str); 15] = [
+    let defs: [(&str, LispFn, Range<usize>, &str); 17] = [
         (
             "open-channel",
             open_channel::<M>,
@@ -177,6 +177,26 @@ fn define_functions<M: Module>(env: &Env) -> Result<()> {
             2..3,
             "Test entry: post a key-down and key-up for CHARS, one letter, to the\n\
              view's window; CTRL non-nil adds Control.\n\n(fn HANDLE CHARS &optional CTRL)",
+        ),
+        (
+            "test-magnify",
+            test_magnify::<M>,
+            2..3,
+            "Test entry: a trackpad pinch of MAGNIFICATION (0.1 is a 10% spread) at\n\
+             the centre of HANDLE's view.  Without DIRECT, the event is posted to the\n\
+             application's event queue and AppKit routes it; with DIRECT, it is\n\
+             handed to the view's `magnifyWithEvent:'.  Return (TYPE MAGNIFICATION\n\
+             WINDOW-NUMBER) of the event made.\n\n\
+             (fn HANDLE MAGNIFICATION &optional DIRECT)",
+        ),
+        (
+            "test-scroll",
+            test_scroll::<M>,
+            2..3,
+            "Test entry: a continuous (trackpad) scroll of DY pixels at the centre of\n\
+             HANDLE's view, posted or, with DIRECT, handed to `scrollWheel:'.  Return\n\
+             (TYPE DELTA-Y WINDOW-NUMBER) of the event made.\n\n\
+             (fn HANDLE DY &optional DIRECT)",
         ),
         (
             "test-counts",
@@ -679,6 +699,203 @@ fn test_post_key<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
             app.postEvent_atStart(&event, false);
         }
         nil(env)
+    })
+}
+
+// Synthetic gesture and scroll events. AppKit has no public constructor for
+// a magnify event; one made by CoreGraphics as a gesture event of HID type
+// zoom becomes an `NSEventTypeMagnify` NSEvent.
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventCreate(source: *const c_void) -> *mut c_void;
+    fn CGEventCreateScrollWheelEvent2(
+        source: *const c_void,
+        units: u32,
+        wheel_count: u32,
+        wheel1: i32,
+        wheel2: i32,
+        wheel3: i32,
+    ) -> *mut c_void;
+    fn CGEventSetType(event: *mut c_void, kind: u32);
+    fn CGEventSetLocation(event: *mut c_void, location: CGPoint);
+    fn CGEventSetIntegerValueField(event: *mut c_void, field: u32, value: i64);
+    fn CGEventSetDoubleValueField(event: *mut c_void, field: u32, value: f64);
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFRelease(cf: *const c_void);
+}
+
+/// CGEvent fields AppKit reads for gestures and for the target window, from
+/// the window server's private event layout.
+const CG_GESTURE: u32 = 29;
+const FIELD_GESTURE_HID_TYPE: u32 = 110;
+const FIELD_GESTURE_ZOOM_VALUE: u32 = 113;
+const FIELD_GESTURE_PHASE: u32 = 132;
+const HID_TYPE_ZOOM: i64 = 8;
+const FIELD_WINDOW_ID: u32 = 51;
+const FIELD_WINDOW_UNDER_POINTER: u32 = 91;
+const FIELD_WINDOW_UNDER_POINTER_THAT_CAN_HANDLE: u32 = 92;
+const FIELD_SCROLL_IS_CONTINUOUS: u32 = 88;
+
+/// The centre of VIEW in CoreGraphics global coordinates (origin at the top
+/// left of the main display), and its window's number.
+fn gesture_target(mtm: MainThreadMarker, view: &NSView) -> Result<(CGPoint, isize)> {
+    let window = view
+        .window()
+        .ok_or_else(|| anyhow::anyhow!("view has no window"))?;
+    let b = view.bounds();
+    let centre = NSPoint::new(
+        b.origin.x + b.size.width / 2.0,
+        b.origin.y + b.size.height / 2.0,
+    );
+    let in_window = view.convertPoint_toView(centre, None);
+    let on_screen = window.convertPointToScreen(in_window);
+    let main_height = NSScreen::screens(mtm)
+        .iter()
+        .next()
+        .map(|s| s.frame().size.height)
+        .unwrap_or(0.0);
+    Ok((
+        CGPoint {
+            x: on_screen.x,
+            y: main_height - on_screen.y,
+        },
+        window.windowNumber(),
+    ))
+}
+
+/// Turn the CGEvent CG (consumed) into an NSEvent and deliver it to VIEW
+/// with SELECTOR when DIRECT, or post it to the application's queue.
+fn deliver_cg_event(
+    mtm: MainThreadMarker,
+    view: &NSView,
+    cg: *mut c_void,
+    window_number: isize,
+    direct: bool,
+    magnify: bool,
+) -> Result<Retained<NSEvent>> {
+    if cg.is_null() {
+        return Err(anyhow::anyhow!("CoreGraphics made no event").into());
+    }
+    unsafe {
+        CGEventSetIntegerValueField(cg, FIELD_WINDOW_ID, window_number as i64);
+        CGEventSetIntegerValueField(cg, FIELD_WINDOW_UNDER_POINTER, window_number as i64);
+        CGEventSetIntegerValueField(
+            cg,
+            FIELD_WINDOW_UNDER_POINTER_THAT_CAN_HANDLE,
+            window_number as i64,
+        );
+    }
+    // The NSEvent made below has no location in its window; move the
+    // pointer to the view's centre first, as the tracking area does when a
+    // real pointer arrives.
+    let b = view.bounds();
+    let centre = view.convertPoint_toView(
+        NSPoint::new(
+            b.origin.x + b.size.width / 2.0,
+            b.origin.y + b.size.height / 2.0,
+        ),
+        None,
+    );
+    let moved = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+        NSEventType::MouseMoved,
+        centre,
+        NSEventModifierFlags::empty(),
+        NSProcessInfo::processInfo().systemUptime(),
+        window_number,
+        None,
+        0,
+        0,
+        0.0,
+    )
+    .ok_or_else(|| anyhow::anyhow!("cannot make a mouse event"))?;
+    unsafe {
+        let _: () = msg_send![view, mouseMoved: &*moved];
+    }
+    let event: Option<Retained<NSEvent>> =
+        unsafe { msg_send![NSEvent::class(), eventWithCGEvent: cg] };
+    unsafe { CFRelease(cg) };
+    let event = event.ok_or_else(|| anyhow::anyhow!("AppKit made no NSEvent of it"))?;
+    if direct {
+        unsafe {
+            if magnify {
+                let _: () = msg_send![view, magnifyWithEvent: &*event];
+            } else {
+                let _: () = msg_send![view, scrollWheel: &*event];
+            }
+        }
+    } else {
+        NSApplication::sharedApplication(mtm).postEvent_atStart(&event, false);
+    }
+    Ok(event)
+}
+
+fn test_magnify<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
+    guard(|| {
+        let mtm = main_thread()?;
+        let args = env.args();
+        let view = view_of::<M>(args[0])?;
+        let magnification = number(env, args[1])?;
+        let direct = args.get(2).is_some_and(|d| d.is_not_nil());
+        let nsview: &NSView = &view;
+        let (at, window_number) = gesture_target(mtm, nsview)?;
+        let cg = unsafe {
+            let cg = CGEventCreate(ptr::null());
+            if !cg.is_null() {
+                CGEventSetType(cg, CG_GESTURE);
+                CGEventSetLocation(cg, at);
+                CGEventSetIntegerValueField(cg, FIELD_GESTURE_HID_TYPE, HID_TYPE_ZOOM);
+                CGEventSetDoubleValueField(cg, FIELD_GESTURE_ZOOM_VALUE, magnification);
+                // NSEventPhaseChanged
+                CGEventSetIntegerValueField(cg, FIELD_GESTURE_PHASE, 4);
+            }
+            cg
+        };
+        let event = deliver_cg_event(mtm, nsview, cg, window_number, direct, true)?;
+        let kind = event.r#type().0 as i64;
+        let made = if event.r#type() == NSEventType::Magnify {
+            event.magnification()
+        } else {
+            0.0
+        };
+        env.list((kind, made, event.windowNumber() as i64))
+    })
+}
+
+fn test_scroll<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
+    guard(|| {
+        let mtm = main_thread()?;
+        let args = env.args();
+        let view = view_of::<M>(args[0])?;
+        let dy = number(env, args[1])?;
+        let direct = args.get(2).is_some_and(|d| d.is_not_nil());
+        let nsview: &NSView = &view;
+        let (at, window_number) = gesture_target(mtm, nsview)?;
+        let cg = unsafe {
+            // kCGScrollEventUnitPixel
+            let cg = CGEventCreateScrollWheelEvent2(ptr::null(), 0, 1, dy.round() as i32, 0, 0);
+            if !cg.is_null() {
+                CGEventSetLocation(cg, at);
+                CGEventSetIntegerValueField(cg, FIELD_SCROLL_IS_CONTINUOUS, 1);
+            }
+            cg
+        };
+        let event = deliver_cg_event(mtm, nsview, cg, window_number, direct, false)?;
+        env.list((
+            event.r#type().0 as i64,
+            event.scrollingDeltaY(),
+            event.windowNumber() as i64,
+        ))
     })
 }
 

@@ -104,6 +104,8 @@ pub(crate) struct Shared {
     pub(crate) id: u64,
     pub(crate) running: AtomicBool,
     pub(crate) focused: AtomicBool,
+    /// The wheel and pinch go to egui, not to Emacs (`current::set_takes_wheel`).
+    pub(crate) takes_wheel: AtomicBool,
     /// In a window and neither hidden nor under a hidden ancestor.
     pub(crate) visible: AtomicBool,
     wake: Mutex<Wake>,
@@ -143,6 +145,7 @@ impl Shared {
             id,
             running: AtomicBool::new(true),
             focused: AtomicBool::new(false),
+            takes_wheel: AtomicBool::new(false),
             visible: AtomicBool::new(false),
             wake: Mutex::new(Wake {
                 dirty: true,

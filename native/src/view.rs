@@ -21,7 +21,8 @@ use objc2::{
     runtime::{AnyClass, AnyObject, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSResponder, NSView, NSWindow,
+    NSEvent, NSEventMask, NSEventModifierFlags, NSEventPhase, NSEventType, NSResponder, NSView,
+    NSWindow,
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CALayerDelegate, CAMetalLayer, CATransaction};
@@ -91,6 +92,24 @@ fn local_pos(view: &NSView, event: &NSEvent) -> egui::Pos2 {
     egui::pos2(p.x as f32, p.y as f32)
 }
 
+/// Where a wheel or a gesture event happened, if it is inside the view. The
+/// pointer is over the view whenever AppKit sends it one, and the tracking
+/// area has reported it already; an event whose location is elsewhere (one
+/// made from a CGEvent without a window location) leaves it there.
+fn push_pointer_if_inside<V: ViewClass>(this: &V, event: &NSEvent) {
+    let pos = local_pos(this, event);
+    let b = this.bounds();
+    if pos.x >= 0.0
+        && pos.y >= 0.0
+        && (pos.x as f64) < b.size.width
+        && (pos.y as f64) < b.size.height
+    {
+        this.ivars()
+            .shared
+            .push_input(egui::Event::PointerMoved(pos));
+    }
+}
+
 fn pointer_button<V: ViewClass>(
     this: &V,
     event: &NSEvent,
@@ -153,11 +172,70 @@ pub fn mouse_exited<V: ViewClass>(this: &V) {
 }
 
 /// The wheel scrolls the buffer, not the widget (contract, *Keyboard and
-/// pointer*).
+/// pointer*), unless the application takes it (`current::set_takes_wheel`).
 pub fn scroll_wheel<V: ViewClass>(this: &V, event: &NSEvent) {
+    let shared = &this.ivars().shared;
+    if shared.takes_wheel.load(Ordering::SeqCst) {
+        // A trackpad or a Magic Mouse reports points; a wheel with notches
+        // reports lines. AppKit's deltas already follow the user's scroll
+        // direction setting, in egui's sign: positive moves content down.
+        let unit = if event.hasPreciseScrollingDeltas() {
+            egui::MouseWheelUnit::Point
+        } else {
+            egui::MouseWheelUnit::Line
+        };
+        push_pointer_if_inside(this, event);
+        shared.push_input(egui::Event::MouseWheel {
+            unit,
+            delta: egui::vec2(
+                event.scrollingDeltaX() as f32,
+                event.scrollingDeltaY() as f32,
+            ),
+            phase: wheel_phase(event),
+            modifiers: modifiers(event.modifierFlags()),
+        });
+        return;
+    }
     if let Some(emacs) = emacs_view(this) {
         unsafe {
             let _: () = msg_send![&*emacs, scrollWheel: event];
+        }
+    }
+}
+
+fn wheel_phase(event: &NSEvent) -> egui::TouchPhase {
+    let phase = event.phase();
+    let phase = if phase.is_empty() {
+        event.momentumPhase()
+    } else {
+        phase
+    };
+    if phase.contains(NSEventPhase::Began) || phase.contains(NSEventPhase::MayBegin) {
+        egui::TouchPhase::Start
+    } else if phase.contains(NSEventPhase::Ended) {
+        egui::TouchPhase::End
+    } else if phase.contains(NSEventPhase::Cancelled) {
+        egui::TouchPhase::Cancel
+    } else {
+        egui::TouchPhase::Move
+    }
+}
+
+/// A trackpad pinch. AppKit sends `magnifyWithEvent:` to the view under the
+/// pointer, not `scrollWheel:`. An application that takes the wheel gets it
+/// as egui's `Zoom`, centred where the fingers are; otherwise it goes to the
+/// `EmacsView`, which makes it an Emacs `pinch` event, as it would without
+/// this view.
+pub fn magnify<V: ViewClass>(this: &V, event: &NSEvent) {
+    let shared = &this.ivars().shared;
+    if shared.takes_wheel.load(Ordering::SeqCst) {
+        push_pointer_if_inside(this, event);
+        shared.push_input(egui::Event::Zoom((event.magnification() as f32).exp()));
+        return;
+    }
+    if let Some(emacs) = emacs_view(this) {
+        unsafe {
+            let _: () = msg_send![&*emacs, magnifyWithEvent: event];
         }
     }
 }

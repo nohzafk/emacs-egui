@@ -20,7 +20,7 @@
 //! | `-push-theme HANDLE THEME` | hand THEME, a plist, to the view |
 //! | `-focus HANDLE`, `-unfocus HANDLE` | let the view take keys, or give them back |
 //! | `-id`, `-frames`, `-info` | the view's id, frame count and a plist about it |
-//! | `-panic`, `-test-click`, `-test-post-key`, `-test-counts`, `-test-deactivate` | test entries |
+//! | `-panic`, `-test-click`, `-test-post-key`, `-test-magnify`, `-test-scroll`, `-test-counts`, `-test-deactivate` | test entries |
 //!
 //! The view is placed by Emacs, not by this module: the handle is a
 //! `user-ptr` whose pointer is the view, ready for `(make-xwidget 'native
@@ -173,6 +173,17 @@ pub mod current {
     /// Whether the view takes keys (`-focus`).
     pub fn focused() -> bool {
         render::current().is_some_and(|s| s.focused.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Whether the wheel and the trackpad's pinch reach egui. By default
+    /// they scroll and zoom the Emacs buffer under the view (contract,
+    /// *Keyboard and pointer*); a pan-and-zoom surface sets this once, from
+    /// its first frame on.
+    pub fn set_takes_wheel(takes: bool) {
+        if let Some(s) = render::current() {
+            s.takes_wheel
+                .store(takes, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Show VALUE as `:KEY VALUE` in the view's `-info`.
@@ -370,6 +381,11 @@ macro_rules! export_app {
                 #[unsafe(method(scrollWheel:))]
                 fn __scroll_wheel(&self, event: &$crate::__rt::NSEvent) {
                     $crate::__rt::view::scroll_wheel(self, event)
+                }
+
+                #[unsafe(method(magnifyWithEvent:))]
+                fn __magnify_with_event(&self, event: &$crate::__rt::NSEvent) {
+                    $crate::__rt::view::magnify(self, event)
                 }
 
                 #[unsafe(method(keyDown:))]
