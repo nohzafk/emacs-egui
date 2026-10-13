@@ -328,6 +328,7 @@ name = "emacs-egui-native"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block2",
  "dispatch2",
  "egui",
  "egui-wgpu",

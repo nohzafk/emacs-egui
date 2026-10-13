@@ -20,6 +20,7 @@ objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
 objc2-quartz-core = "0.3"
 dispatch2 = "0.3"
+block2 = "0.6"
 raw-window-handle = "0.6"
 
 [profile.release]
