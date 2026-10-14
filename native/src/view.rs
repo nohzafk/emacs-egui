@@ -38,7 +38,7 @@ use crate::{
 /// What a view owns while it renders; taken and dropped by `stop_render`.
 pub(crate) struct Render {
     pub(crate) layer: Retained<CAMetalLayer>,
-    pub(crate) _delegate: Retained<ProtocolObject<dyn CALayerDelegate>>,
+    pub(crate) delegate: Retained<ProtocolObject<dyn CALayerDelegate>>,
     pub(crate) thread: JoinHandle<()>,
 }
 
@@ -334,6 +334,32 @@ pub fn update_visibility<V: ViewClass>(this: &V, by: &'static str) {
         return;
     }
     let now = std::time::Instant::now();
+    // Hidden, the layer leaves the tree and a new one, which has no
+    // drawables yet, takes its place: the render thread lets go of the old
+    // one when it pauses, and the old layer is freed with the drawable it
+    // last presented, which it would keep while it lives. Shown, the new
+    // layer goes in before the frame that resumes; until that frame the view
+    // shows what is behind it.
+    if let Some(render) = this.ivars().render.borrow_mut().as_mut() {
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        if visible {
+            if let Some(host) = view.layer() {
+                host.addSublayer(&render.layer);
+            }
+        } else {
+            render.layer.removeFromSuperlayer();
+            render.layer.setDelegate(None);
+            let fresh = metal_layer(
+                render.layer.frame(),
+                render.layer.contentsScale(),
+                &render.delegate,
+            );
+            render.layer = fresh.clone();
+            shared.set_layer(fresh);
+        }
+        CATransaction::commit();
+    }
     if visible {
         shared.unhides.fetch_add(1, Ordering::SeqCst);
         *lock(&shared.hidden_at) = None;
@@ -399,6 +425,22 @@ pub fn resized<V: ViewClass>(this: &V, size: NSSize) {
     shared.request_frame();
 }
 
+/// A Metal layer for a view, FRAME in the view's points, its delegate
+/// DELEGATE (whose `window` is nil, so wgpu-hal never walks to AppKit from
+/// the render thread).
+pub(crate) fn metal_layer(
+    frame: NSRect,
+    scale: f64,
+    delegate: &ProtocolObject<dyn CALayerDelegate>,
+) -> Retained<CAMetalLayer> {
+    let layer = CAMetalLayer::new();
+    layer.setFrame(frame);
+    layer.setContentsScale(scale);
+    layer.setOpaque(true);
+    layer.setDelegate(Some(delegate));
+    layer
+}
+
 /// Stop the render thread and drop what it drew with. The view itself stays
 /// wherever Emacs put it, showing its last frame.
 pub(crate) fn stop_render<V: ViewClass>(this: &V) {
@@ -408,6 +450,12 @@ pub(crate) fn stop_render<V: ViewClass>(this: &V) {
     let shared = &this.ivars().shared;
     shared.stop();
     let _ = render.thread.join();
+    // Out of the tree and released here, the layer is freed with its
+    // drawables.
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    render.layer.removeFromSuperlayer();
+    CATransaction::commit();
     render.layer.setDelegate(None);
     set_focused(this, false);
     emit(shared.id, "released", "");

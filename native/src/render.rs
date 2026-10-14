@@ -23,7 +23,7 @@ use std::{
 use egui_wgpu::wgpu;
 use emacs_egui_sdk::{parse_hex_color, AppHost, Applied, EguiEmacsApp, ThemeColors};
 use objc2::rc::Retained;
-use objc2_quartz_core::CAMetalLayer;
+use objc2_quartz_core::{CAMetalLayer, CATransaction};
 
 use crate::{convert::lisp_string, events::emit, lock, panics};
 
@@ -122,6 +122,10 @@ pub(crate) struct Shared {
     pub(crate) first_frame_ms: Mutex<Option<f64>>,
     pub(crate) fps: Mutex<f64>,
     pub(crate) surface_format: Mutex<String>,
+    /// The surface's configuration as the render thread last set it:
+    /// `desired_maximum_frame_latency` and `present_mode`, or `None` while
+    /// it is not configured.
+    pub(crate) surface_config: Mutex<Option<(u32, String)>>,
     /// Whether a widget held egui's keyboard focus in the last frame.
     pub(crate) egui_focus: AtomicBool,
     /// Frames drawn since the view was last focused.
@@ -132,6 +136,13 @@ pub(crate) struct Shared {
     /// thread has drawn after it.
     pub(crate) shown_at: Mutex<Option<(Instant, &'static str)>>,
     pub(crate) pause_ms: Mutex<Option<f64>>,
+    /// How long the last pause took to give back the drawables.
+    pub(crate) release_ms: Mutex<Option<f64>>,
+    /// The layer the view shows now, and how many it has had: the view puts
+    /// a new one in when it is hidden (`view::update_visibility`), and the
+    /// render thread makes its surface on whichever is current.
+    layer: Mutex<Option<SendLayer>>,
+    pub(crate) layers: AtomicU64,
     pub(crate) resume_ms: Mutex<Option<f64>>,
     /// What the application published for `-info` (`current::set_info`).
     pub(crate) app_info: Mutex<Vec<(String, serde_json::Value)>>,
@@ -170,11 +181,15 @@ impl Shared {
             first_frame_ms: Mutex::new(None),
             fps: Mutex::new(0.0),
             surface_format: Mutex::new(String::new()),
+            surface_config: Mutex::new(None),
             egui_focus: AtomicBool::new(false),
             focus_frames: AtomicU64::new(0),
             hidden_at: Mutex::new(None),
             shown_at: Mutex::new(None),
             pause_ms: Mutex::new(None),
+            release_ms: Mutex::new(None),
+            layer: Mutex::new(None),
+            layers: AtomicU64::new(0),
             resume_ms: Mutex::new(None),
             app_info: Mutex::new(Vec::new()),
             mouse: Default::default(),
@@ -228,6 +243,19 @@ impl Shared {
         (p.states, p.themes)
     }
 
+    /// Make LAYER the one the render thread draws on from its next frame.
+    pub(crate) fn set_layer(&self, layer: Retained<CAMetalLayer>) {
+        *lock(&self.layer) = Some(SendLayer(layer));
+        self.layers.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The current layer and its number.
+    fn current_layer(&self) -> Option<(Retained<CAMetalLayer>, u64)> {
+        let layer = lock(&self.layer);
+        let n = self.layers.load(Ordering::SeqCst);
+        layer.as_ref().map(|l| (l.0.clone(), n))
+    }
+
     pub(crate) fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
         self.nudge();
@@ -258,9 +286,15 @@ pub(crate) fn current_id() -> Option<u64> {
 // Render thread
 // ---------------------------------------------------------------------------
 
-/// The Metal layer crosses to the render thread only to re-enable the drawable
-/// timeout after wgpu configures the surface; CALayer properties are safe to
-/// set off the main thread.
+/// Frames the surface may queue ahead of the display. wgpu-hal gives the
+/// layer `maximumDrawableCount` one more than this, so 1 keeps two drawables
+/// (the one on screen and the one being drawn) where the default 2 keeps
+/// three; a view that draws on demand never has a third frame to queue.
+const FRAME_LATENCY: u32 = 1;
+
+/// A Metal layer crosses to the render thread to make the surface on and to
+/// re-enable the drawable timeout after wgpu configures it; CALayer
+/// properties are safe to set off the main thread.
 pub(crate) struct SendLayer(pub(crate) Retained<CAMetalLayer>);
 unsafe impl Send for SendLayer {}
 
@@ -270,6 +304,7 @@ pub(crate) fn spawn<A: EguiEmacsApp + 'static>(
     gpu: Arc<Gpu>,
     surface: wgpu::Surface<'static>,
     layer: SendLayer,
+    layer_number: u64,
     make_app: fn() -> A,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     let name = format!("emacs-egui-native-{}", shared.id);
@@ -277,13 +312,17 @@ pub(crate) fn spawn<A: EguiEmacsApp + 'static>(
         LIVE_THREADS.fetch_add(1, Ordering::SeqCst);
         let id = shared.id;
         CURRENT.with(|c| *c.borrow_mut() = Some(shared.clone()));
+        let exit_gpu = gpu.clone();
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            render_loop(&shared, gpu, surface, layer, make_app)
+            render_loop(&shared, gpu, surface, layer, layer_number, make_app)
         }));
         if let Err(e) = result {
             let msg = panics::take_message(&*e);
             emit(id, "error", &format!(":message {}", lisp_string(&msg)));
         }
+        // The surface, the renderer and their textures are dropped by now,
+        // whether the loop ended or panicked.
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| wait_for_gpu(&exit_gpu)));
         CURRENT.with(|c| *c.borrow_mut() = None);
         LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
     })
@@ -324,19 +363,25 @@ fn take_input(shared: &Shared) -> Vec<egui::Event> {
     taken
 }
 
-/// Block until the view has a frame to draw; false once the view stops.
-/// A hidden view waits for whatever egui asked, and notes when it paused.
-fn wait_for_frame(shared: &Shared) -> bool {
+/// What the render thread does next.
+enum Next {
+    Frame,
+    /// The view was hidden at this instant and the thread has not paused yet.
+    Pause(Instant),
+    Stop,
+}
+
+/// Block until the view has a frame to draw, has just been hidden, or stops.
+/// A hidden view waits for whatever egui asked.
+fn wait_for_frame(shared: &Shared) -> Next {
     let mut wake = lock(&shared.wake);
     loop {
         if !shared.running.load(Ordering::SeqCst) {
-            return false;
+            return Next::Stop;
         }
         if !shared.visible.load(Ordering::SeqCst) {
             if let Some(at) = lock(&shared.hidden_at).take() {
-                let ms = at.elapsed().as_secs_f64() * 1000.0;
-                *lock(&shared.pause_ms) = Some(ms);
-                emit(shared.id, "paused", &format!(":ms {ms:.3}"));
+                return Next::Pause(at);
             }
             wake = shared.wake_cv.wait(wake).unwrap_or_else(|e| e.into_inner());
             continue;
@@ -363,7 +408,17 @@ fn wait_for_frame(shared: &Shared) -> bool {
     }
     wake.dirty = false;
     wake.repaint_at = None;
-    true
+    Next::Frame
+}
+
+/// Wait for the GPU, so wgpu destroys the surface textures, drawables and
+/// textures dropped since the last submit: it frees them when the shared
+/// device is next polled, and with no view left to submit nothing polls it.
+fn wait_for_gpu(gpu: &Gpu) {
+    let _ = gpu.device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: Some(Duration::from_secs(1)),
+    });
 }
 
 fn clear_color(theme: &ThemeColors) -> wgpu::Color {
@@ -384,6 +439,7 @@ fn render_loop<A: EguiEmacsApp>(
     gpu: Arc<Gpu>,
     surface: wgpu::Surface<'static>,
     layer: SendLayer,
+    layer_number: u64,
     make_app: fn() -> A,
 ) {
     let ctx = egui::Context::default();
@@ -399,11 +455,63 @@ fn render_loop<A: EguiEmacsApp>(
     let mut renderer =
         egui_wgpu::Renderer::new(&gpu.device, format, egui_wgpu::RendererOptions::default());
     let mut configured: Option<(u32, u32)> = None;
+    // The surface and the layer it draws on go together: both are dropped at
+    // a pause, so the layer the view no longer shows is freed with its
+    // drawables. A layer keeps the last drawable it presented until it is
+    // freed; nothing presented to a hidden layer replaces it.
+    let mut surface = Some((surface, layer.0, layer_number));
     let start = Instant::now();
     let mut report_at = Instant::now();
     let mut report_frames = 0u64;
 
-    while wait_for_frame(shared) {
+    loop {
+        match wait_for_frame(shared) {
+            Next::Stop => break,
+            Next::Pause(at) => {
+                // Hidden: the drawables go and the surface with them; the
+                // egui context, the renderer and its textures stay, so a
+                // resume makes a surface and draws.
+                let ms = at.elapsed().as_secs_f64() * 1000.0;
+                let t = Instant::now();
+                surface = None;
+                configured = None;
+                *lock(&shared.surface_config) = None;
+                wait_for_gpu(&gpu);
+                CATransaction::flush();
+                let release = t.elapsed().as_secs_f64() * 1000.0;
+                *lock(&shared.pause_ms) = Some(ms);
+                *lock(&shared.release_ms) = Some(release);
+                emit(
+                    shared.id,
+                    "paused",
+                    &format!(":ms {ms:.3} :release-ms {release:.3}"),
+                );
+                continue;
+            }
+            Next::Frame => {}
+        }
+        let current = shared.layers.load(Ordering::SeqCst);
+        if surface.as_ref().is_some_and(|(_, _, n)| *n != current) {
+            surface = None;
+            configured = None;
+        }
+        if surface.is_none() {
+            let Some((layer, n)) = shared.current_layer() else {
+                break;
+            };
+            match surface_on(&gpu, &layer) {
+                Ok(s) => surface = Some((s, layer, n)),
+                Err(e) => {
+                    emit(
+                        shared.id,
+                        "error",
+                        &format!(":message {}", lisp_string(&e.to_string())),
+                    );
+                    break;
+                }
+            }
+        }
+        let (surface, layer, _) = surface.as_ref().expect("made above");
         let geo = *lock(&shared.geometry);
         let px = (
             (geo.width * geo.scale).round().max(1.0) as u32,
@@ -421,14 +529,16 @@ fn render_loop<A: EguiEmacsApp>(
                     present_mode: wgpu::PresentMode::Fifo,
                     alpha_mode: wgpu::CompositeAlphaMode::Opaque,
                     view_formats: vec![format],
-                    desired_maximum_frame_latency: 2,
-                    ..surface_config_defaults(&surface, &gpu, px)
+                    desired_maximum_frame_latency: FRAME_LATENCY,
+                    ..surface_config_defaults(surface, &gpu, px)
                 },
             );
             // wgpu turns the drawable timeout off; a hidden layer would then
             // block `nextDrawable` forever and `release` could not join us.
-            layer.0.setAllowsNextDrawableTimeout(true);
+            layer.setAllowsNextDrawableTimeout(true);
             configured = Some(px);
+            *lock(&shared.surface_config) =
+                Some((FRAME_LATENCY, format!("{:?}", wgpu::PresentMode::Fifo)));
         }
 
         let frame = match surface.get_current_texture() {
@@ -548,6 +658,10 @@ fn render_loop<A: EguiEmacsApp>(
                 .submit(user_buffers.into_iter().chain([encoder.finish()]));
             gpu.queue.present(frame);
         }
+        // Presenting opens an implicit Core Animation transaction, which a
+        // thread with no run loop never commits; until it is, it holds the
+        // layer and the drawables it touched.
+        CATransaction::flush();
         for id in &output.textures_delta.free {
             renderer.free_texture(id);
         }

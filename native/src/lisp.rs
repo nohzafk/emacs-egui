@@ -36,7 +36,7 @@ use objc2_app_kit::{
     NSTrackingAreaOptions, NSView,
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSProcessInfo, NSRect, NSSize, NSString};
-use objc2_quartz_core::{CALayer, CAMetalLayer};
+use objc2_quartz_core::CALayer;
 
 use crate::{convert, events, lock, panics::guard, render, view, Module, ViewClass, ViewIvars};
 
@@ -366,13 +366,10 @@ fn make_view<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
         let host = CALayer::new();
         nsview.setLayer(Some(&host));
         nsview.setWantsLayer(true);
-        let layer = CAMetalLayer::new();
-        layer.setFrame(frame);
-        layer.setContentsScale(scale);
-        layer.setOpaque(true);
         let delegate = M::View::layer_delegate();
-        layer.setDelegate(Some(&*delegate));
+        let layer = view::metal_layer(frame, scale, &delegate);
         host.addSublayer(&layer);
+        shared.set_layer(layer.clone());
 
         let tracking = unsafe {
             NSTrackingArea::initWithRect_options_owner_userInfo(
@@ -394,11 +391,12 @@ fn make_view<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
             gpu,
             surface,
             render::SendLayer(layer.clone()),
+            shared.layers.load(Ordering::SeqCst),
             M::make_app,
         )?;
         *view.ivars().render.borrow_mut() = Some(view::Render {
             layer,
-            _delegate: delegate,
+            delegate,
             thread,
         });
 
@@ -492,15 +490,20 @@ fn info<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
         let geo = *lock(&s.geometry);
         let (egui_w, egui_h) = *lock(&s.egui_screen);
         let render = view.ivars().render.borrow();
-        let (layer, drawable) = match render.as_ref() {
+        let (layer, drawable, max_drawables) = match render.as_ref() {
             Some(r) => {
                 let b = r.layer.bounds();
                 let d = r.layer.drawableSize();
                 (
                     env.list((b.size.width, b.size.height))?,
                     env.list((d.width, d.height))?,
+                    (r.layer.maximumDrawableCount() as i64).into_lisp(env)?,
                 )
             }
+            None => (nil(env)?, nil(env)?, nil(env)?),
+        };
+        let (frame_latency, present_mode) = match lock(&s.surface_config).clone() {
+            Some((latency, mode)) => ((latency as i64).into_lisp(env)?, mode.into_lisp(env)?),
             None => (nil(env)?, nil(env)?),
         };
         let emacs = view::emacs_view(nsview);
@@ -563,6 +566,8 @@ fn info<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
             (*lock(&s.pause_ms)).into_lisp(env)?,
             env.intern(":resume-ms")?,
             (*lock(&s.resume_ms)).into_lisp(env)?,
+            env.intern(":release-ms")?,
+            (*lock(&s.release_ms)).into_lisp(env)?,
             env.intern(":focused")?,
             s.focused.load(Ordering::SeqCst).into_lisp(env)?,
             env.intern(":egui-focus")?,
@@ -591,6 +596,12 @@ fn info<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
             layer,
             env.intern(":drawable")?,
             drawable,
+            env.intern(":max-drawables")?,
+            max_drawables,
+            env.intern(":frame-latency")?,
+            frame_latency,
+            env.intern(":present-mode")?,
+            present_mode,
             env.intern(":egui-screen")?,
             env.list((egui_w as f64, egui_h as f64))?,
             env.intern(":first-responder")?,
