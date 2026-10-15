@@ -421,6 +421,15 @@ fn wait_for_gpu(gpu: &Gpu) {
     });
 }
 
+/// Paint LAYER's own background in the theme's background, the colour every
+/// frame is cleared to: the part of a grown layer that no drawable covers yet
+/// shows it rather than black.
+fn layer_background(layer: &CAMetalLayer, theme: &ThemeColors) {
+    let c = clear_color(theme);
+    let color = objc2_core_graphics::CGColor::new_srgb(c.r, c.g, c.b, 1.0);
+    layer.setBackgroundColor(Some(&color));
+}
+
 fn clear_color(theme: &ThemeColors) -> wgpu::Color {
     // The surface is not sRGB, so egui's gamma-space colours go in unchanged.
     match parse_hex_color(&theme.bg) {
@@ -536,6 +545,7 @@ fn render_loop<A: EguiEmacsApp>(
             // wgpu turns the drawable timeout off; a hidden layer would then
             // block `nextDrawable` forever and `release` could not join us.
             layer.setAllowsNextDrawableTimeout(true);
+            layer_background(layer, host.theme());
             configured = Some(px);
             *lock(&shared.surface_config) =
                 Some((FRAME_LATENCY, format!("{:?}", wgpu::PresentMode::Fifo)));
@@ -569,6 +579,7 @@ fn render_loop<A: EguiEmacsApp>(
         };
         if let Some(theme) = theme {
             host.push_theme(theme);
+            layer_background(layer, host.theme());
         }
         if let Some(value) = state {
             match AppHost::<A>::decode(value) {

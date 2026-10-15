@@ -25,7 +25,7 @@ use objc2_app_kit::{
     NSWindow,
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize};
-use objc2_quartz_core::{CALayerDelegate, CAMetalLayer, CATransaction};
+use objc2_quartz_core::{kCAGravityBottomLeft, CALayerDelegate, CAMetalLayer, CATransaction};
 
 use crate::{
     convert::lisp_string,
@@ -437,6 +437,19 @@ pub(crate) fn metal_layer(
     layer.setFrame(frame);
     layer.setContentsScale(scale);
     layer.setOpaque(true);
+    // Emacs resizes the view on the main thread and the render thread draws
+    // the new size a frame or two later. Until then the layer shows its last
+    // drawable unscaled at the top left, where egui's layout is anchored,
+    // instead of stretched to the new bounds.
+    //
+    // BottomLeft is the visual top left here. Gravity names edges in the
+    // layer's own unflipped space, where "top" is the largest y. This layer
+    // sits under a flipped view (`isFlipped` is true, as for Emacs's own
+    // view), so AppKit renders its contents flipped (`contentsAreFlipped`)
+    // and that edge is at the bottom of the screen. TopLeft would show the
+    // last drawable at the bottom of a grown layer, and the view would jump
+    // down by the growth for a frame.
+    layer.setContentsGravity(unsafe { kCAGravityBottomLeft });
     layer.setDelegate(Some(delegate));
     layer
 }
