@@ -29,6 +29,16 @@ pub(crate) fn emit(id: u64, action: &str, payload: &str) {
 /// from inside `update`, on the render thread of the view it draws. A
 /// message from any other thread names no view and is dropped.
 pub(crate) fn app_message(action: &str, payload: serde_json::Value) {
+    // The reserved `resize': the render thread holds frames laid out for
+    // the new size until the view has it (`render::hold_for_resize`).
+    if action == "resize" {
+        if let Some(shared) = render::current() {
+            let num = |k| payload.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
+            if let (Some(w), Some(h)) = (num("width"), num("height")) {
+                *lock(&shared.wanted) = Some((w, h));
+            }
+        }
+    }
     if let Some(id) = render::current_id() {
         emit(
             id,

@@ -118,6 +118,9 @@ pub(crate) struct Shared {
     pub(crate) geometry: Mutex<Geometry>,
     /// The screen rectangle egui laid out the last frame in, in points.
     pub(crate) egui_screen: Mutex<(f32, f32)>,
+    /// The size the application last asked for with `resize`, until a frame
+    /// is drawn in another size or the wait for it runs out.
+    pub(crate) wanted: Mutex<Option<(f32, f32)>>,
     created_at: Instant,
     pub(crate) first_frame_ms: Mutex<Option<f64>>,
     pub(crate) fps: Mutex<f64>,
@@ -177,6 +180,7 @@ impl Shared {
                 scale: scale as f32,
             }),
             egui_screen: Mutex::new((0.0, 0.0)),
+            wanted: Mutex::new(None),
             created_at,
             first_frame_ms: Mutex::new(None),
             fps: Mutex::new(0.0),
@@ -472,6 +476,8 @@ fn render_loop<A: EguiEmacsApp>(
     let start = Instant::now();
     let mut report_at = Instant::now();
     let mut report_frames = 0u64;
+    // While frames are held for a resize: since when, and the view's size.
+    let mut hold: Option<(Instant, (f32, f32))> = None;
 
     loop {
         match wait_for_frame(shared) {
@@ -623,6 +629,24 @@ fn render_loop<A: EguiEmacsApp>(
             .get(&egui::ViewportId::ROOT)
             .map(|v| v.repaint_delay)
             .unwrap_or(Duration::MAX);
+        // A frame laid out for a bigger size than the view has would show
+        // clipped to the view: keep it off screen until Emacs resizes the
+        // view, which wakes this thread, or for at most HOLD_MAX.
+        if hold_for_resize(shared, &geo, &mut hold) {
+            for (id, deltas) in &output.textures_delta.set {
+                for delta in deltas {
+                    renderer.update_texture(&gpu.device, &gpu.queue, *id, delta);
+                }
+            }
+            for id in &output.textures_delta.free {
+                renderer.free_texture(id);
+            }
+            drop(frame);
+            let (since, _) = hold.expect("set when holding");
+            let mut wake = lock(&shared.wake);
+            wake.repaint_at = Some(since + HOLD_MAX);
+            continue;
+        }
         let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [px.0, px.1],
@@ -717,6 +741,35 @@ fn render_loop<A: EguiEmacsApp>(
             report_frames = 0;
         }
     }
+}
+
+/// The longest a frame is kept off screen waiting for the view to grow.
+const HOLD_MAX: Duration = Duration::from_millis(100);
+
+/// Whether to keep the frame just laid out in GEO off screen: the
+/// application asked for a size bigger than GEO, the view has kept the size
+/// it had when holding began, and HOLD_MAX has not passed since. HOLD is
+/// that start and that size. The request is dropped once a frame is laid
+/// out in another size, or the wait runs out.
+fn hold_for_resize(
+    shared: &Shared,
+    geo: &Geometry,
+    hold: &mut Option<(Instant, (f32, f32))>,
+) -> bool {
+    let mut wanted = lock(&shared.wanted);
+    let size = (geo.width, geo.height);
+    let Some((w, h)) = *wanted else {
+        *hold = None;
+        return false;
+    };
+    let grows = w > geo.width + 0.5 || h > geo.height + 0.5;
+    let (since, held) = *hold.get_or_insert((Instant::now(), size));
+    if !grows || size != held || since.elapsed() >= HOLD_MAX {
+        *wanted = None;
+        *hold = None;
+        return false;
+    }
+    true
 }
 
 fn surface_config_defaults(
