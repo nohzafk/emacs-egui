@@ -91,7 +91,8 @@ pub(crate) struct Wake {
 /// What Emacs pushed and the render thread has not drawn yet.
 #[derive(Default)]
 struct Pushed {
-    state: Option<serde_json::Value>,
+    /// The states the next frame hands the application, oldest first.
+    states_due: Vec<serde_json::Value>,
     theme: Option<ThemeColors>,
     /// How many states and themes Emacs has pushed, the undrawn ones included.
     states: u64,
@@ -220,11 +221,24 @@ impl Shared {
     }
 
     /// Replace the state the next frame hands the application; a state not
-    /// drawn yet is superseded.
+    /// drawn yet, pushed or sent, is superseded.
     pub(crate) fn push_state(&self, state: serde_json::Value) {
         {
             let mut p = lock(&self.pushed);
-            p.state = Some(state);
+            p.states_due.clear();
+            p.states_due.push(state);
+            p.states += 1;
+            p.since.get_or_insert_with(Instant::now);
+        }
+        self.request_frame();
+    }
+
+    /// Queue a state behind the ones not drawn yet: the next frame hands the
+    /// application every queued state in order, none superseded.
+    pub(crate) fn send_state(&self, state: serde_json::Value) {
+        {
+            let mut p = lock(&self.pushed);
+            p.states_due.push(state);
             p.states += 1;
             p.since.get_or_insert_with(Instant::now);
         }
@@ -573,10 +587,10 @@ fn render_loop<A: EguiEmacsApp>(
         };
 
         // What Emacs pushed since the last frame.
-        let (state, theme, states, themes, since) = {
+        let (due, theme, states, themes, since) = {
             let mut p = lock(&shared.pushed);
             (
-                p.state.take(),
+                std::mem::take(&mut p.states_due),
                 p.theme.take(),
                 p.states,
                 p.themes,
@@ -587,7 +601,7 @@ fn render_loop<A: EguiEmacsApp>(
             host.push_theme(theme);
             layer_background(layer, host.theme());
         }
-        if let Some(value) = state {
+        for value in due {
             match AppHost::<A>::decode(value) {
                 Ok(state) => host.push_state(state),
                 Err(m) => emit(

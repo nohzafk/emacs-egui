@@ -78,7 +78,7 @@ pub unsafe fn module_init<M: Module>(runtime: *mut emacs_runtime) -> c_int {
 
 fn define_functions<M: Module>(env: &Env) -> Result<()> {
     let p = M::PREFIX;
-    let defs: [(&str, LispFn, Range<usize>, &str); 19] = [
+    let defs: [(&str, LispFn, Range<usize>, &str); 20] = [
         (
             "open-channel",
             open_channel::<M>,
@@ -115,6 +115,16 @@ fn define_functions<M: Module>(env: &Env) -> Result<()> {
              STATE is converted to the JSON value the web backend would parse, and\n\
              must deserialize into the application's state type; an error says where\n\
              it does not.  The view emits `painted' after the frame that shows it.\n\n\
+             (fn HANDLE STATE)",
+        ),
+        (
+            "send",
+            send::<M>,
+            2..2,
+            "Queue STATE, a plist, for HANDLE's application behind what is not drawn yet.\n\n\
+             Where `push' replaces an undrawn state, `send' keeps every one: the next\n\
+             frame hands the application each queued state in order, so a stream of\n\
+             messages loses none.  STATE is converted and checked as for `push'.\n\n\
              (fn HANDLE STATE)",
         ),
         (
@@ -433,6 +443,18 @@ fn push<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
             return Err(anyhow::anyhow!("the state does not fit the application: {e}").into());
         }
         view.ivars().shared.push_state(value);
+        nil(env)
+    })
+}
+
+fn send<M: Module>(env: &CallEnv) -> Result<Value<'_>> {
+    guard(|| {
+        let view = view_of::<M>(env.get_arg(0))?;
+        let value = convert::lisp_to_json(env, env.get_arg(1))?;
+        if let Err(e) = AppHost::<M::App>::decode(value.clone()) {
+            return Err(anyhow::anyhow!("the state does not fit the application: {e}").into());
+        }
+        view.ivars().shared.send_state(value);
         nil(env)
     })
 }

@@ -255,7 +255,7 @@ The module is loaded once. Every view of it writes its events to one pipe proces
     (pop-to-buffer buf)))
 ```
 
-A push made before the view's first frame is kept and shown in that frame. `(emacs-egui-app-my-app-focus handle)` gives the view the keyboard; `C-g` gives it back.
+A push made before the view's first frame is kept and shown in that frame. Where the states are messages rather than a snapshot (a feed of events), `-send` keeps every one and `on_state_update` is called once per message, in order, before the frame. `(emacs-egui-app-my-app-focus handle)` gives the view the keyboard; `C-g` gives it back.
 
 ### Elisp, web backend
 
@@ -369,6 +369,7 @@ Both backends post `ready` after the first frame and `painted` after a frame tha
 | `current::set_takes_wheel(bool)` | From `update`: whether the wheel and pinch go to egui rather than the buffer. |
 | `current::focused()`, `current::id()` | From `update`: whether the view has the keyboard; its numeric id. |
 | `current::set_info(key, value)` | From `update`: show VALUE as `:KEY` in `-info`. |
+| `current::repaint_handle()` | From `update`: a `Send + Sync` handle whose `request_repaint()` asks the view for a frame from any thread, for an application fed by its own reader thread. It does not keep the view alive. |
 
 ### Elisp: native module functions
 
@@ -378,7 +379,8 @@ Each is named after the module's prefix, here `emacs-egui-app-my-app`.
 |----------|-------------|
 | `(-open-channel PROC)` | Send every view's events to the pipe process PROC. |
 | `(-make-view W H &optional THEME)` | Make a view of W × H points running a new instance of the application; THEME is a plist (`:bg :fg :font-size :font-family`) applied before the first frame. Returns the handle for `(make-xwidget 'native TITLE W H HANDLE BUFFER)`. |
-| `(-push HANDLE STATE)` | Hand STATE, a plist, to the application; an error if it does not deserialize into `State`. |
+| `(-push HANDLE STATE)` | Hand STATE, a plist, to the application; an error if it does not deserialize into `State`. A state not drawn yet, pushed or sent, is superseded: a push is the latest state. |
+| `(-send HANDLE STATE)` | Queue STATE behind what is not drawn yet; the next frame hands the application every queued state in order, so a stream of messages loses none. The queue grows while the view is hidden and draws no frame. |
 | `(-push-theme HANDLE THEME)` | Hand a new theme to the view. |
 | `(-focus HANDLE)`, `(-unfocus HANDLE)` | Give the view the keyboard (all keys but `C-g`), or give it back to Emacs. |
 | `(-release HANDLE)` | Stop the view's render thread and drop the module's reference; the xwidget keeps its own until it is killed. Releasing twice does nothing. |

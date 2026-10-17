@@ -197,6 +197,28 @@ pub mod current {
         }
     }
 
+    /// A handle that asks the view for a frame from any thread. An
+    /// application whose data arrives on its own thread (a socket reader, a
+    /// timer) takes one in `update` and keeps it there, instead of polling
+    /// with `request_repaint_after`. The handle does not keep the view alive:
+    /// after the view is released, `request_repaint` does nothing.
+    pub fn repaint_handle() -> Option<RepaintHandle> {
+        render::current().map(|s| RepaintHandle(std::sync::Arc::downgrade(&s)))
+    }
+
+    /// See [`repaint_handle`].
+    #[derive(Clone)]
+    pub struct RepaintHandle(std::sync::Weak<render::Shared>);
+
+    impl RepaintHandle {
+        /// Ask the view for a frame; wakes its render thread if it sleeps.
+        pub fn request_repaint(&self) {
+            if let Some(s) = self.0.upgrade() {
+                s.request_frame();
+            }
+        }
+    }
+
     /// Name RECT, in the view's points, for `-test-click`.
     pub fn set_click_target(name: &str, rect: egui::Rect) {
         if let Some(s) = render::current() {
