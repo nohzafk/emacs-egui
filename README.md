@@ -78,7 +78,6 @@ graph TB
 |------|------------|
 | `sdk/` (`emacs-egui-sdk`) | What an application is written against, whichever backend hosts it: the `EguiEmacsApp` trait, `ThemeColors`, and `emacs_post_message`. Emacs pushes state as a plist (native) or JSON (web); both arrive as one `serde_json::Value` and are deserialized into the application's `State` type, and a state that does not fit is an error that names where, as `sections[0].priority`. A theme (`:bg`, `:fg`, `:font-size`, `:surface-bg`, `:font-family`) is mapped onto egui's style before `on_theme_update` is called. The cargo feature `web` adds the eframe bootstrap (`launch`, `launch_simple`), the JavaScript entry points `egui_push_state` and `egui_push_theme`, and the loopback helpers `file_url` and `fetch_bytes`. The SDK re-exports `egui`, `serde` and `serde_json`. |
 | `native/` (`emacs-egui-native`) | The native runtime, a library an application module links. `export_app!` makes the application crate an Emacs module whose functions are named `emacs-egui-app-NAME-…` (see [API reference](#native-module-functions)). Each view is an `NSView` backed by a `CAMetalLayer`, placed by Emacs through `make-xwidget 'native`; a render thread per view draws only when there is input, a push, a resize, an unhide or a repaint egui asked for, and not at all while the view is hidden. Events reach Elisp as lines on a pipe process. Keys go to Emacs unless the view is focused; `C-g` always reaches Emacs and unfocuses the view. A click reaches egui and also selects the Emacs window the view is in. The wheel and the trackpad pinch scroll and zoom the buffer, unless the application calls `current::set_takes_wheel(true)`, after which egui receives them. A Rust panic in a module function reaches Lisp as the `rust-panic` signal with its message and location; a panic on a render thread becomes an `error` event. |
-| `raster/` (`emacs-egui-raster`) | A separate dynamic module that renders SVG to PNG with [resvg](https://github.com/linebender/resvg), so Emacs shows the same image whichever SVG engine it was built with (AppKit's, without librsvg, has no markers and ignores `dy` on text rows). `emacs-egui-raster-svg` returns PNG bytes, `emacs-egui-raster-svg-size` the SVG's own size, `emacs-egui-raster-fonts` what the shared font database loaded. Independent of the SDK; it builds on its own. |
 | `lisp/emacs-egui.el` | The web backend's Elisp runtime: a loopback HTTP server for the application's assets, local files and events, the xwidget-webkit sessions, theme sync, and the callback registry. The native backend needs no Elisp runtime: the module's own functions and a pipe process are the whole interface. |
 
 ---
@@ -388,14 +387,6 @@ Each is named after the module's prefix, here `emacs-egui-app-my-app`.
 | `-panic`, `-test-*` | Test entries: a deliberate panic; posted clicks, mouse events, keys, pinches and scrolls; counters. |
 
 The module's own events are `ready`, `painted`, `hidden`, `shown`, `paused`, `resumed`, `frames`, `unfocus`, `released` and `error`; the application's come from `emacs_post_message`. A pushed plist becomes a JSON object keyed by the keywords' names without the colon; another list or a vector becomes an array (so a list of plists is an array of objects), `t` is `true`, `nil` is `null` and `:json-false` is `false`. A value with no JSON form is an error that names where it is.
-
-### Elisp: `emacs-egui-raster`
-
-| Function | Description |
-|----------|-------------|
-| `(emacs-egui-raster-svg SVG &key WIDTH HEIGHT SCALE DEFAULT-FONT)` | Render SVG to PNG and return it as a unibyte string. WIDTH and HEIGHT are the box in points the image is fitted into, SCALE the device pixels per point, DEFAULT-FONT the family of text that names none. Signals `emacs-egui-raster-error` on SVG it cannot parse. |
-| `(emacs-egui-raster-svg-size SVG)` | The SVG's own size in points, `(WIDTH . HEIGHT)`. |
-| `(emacs-egui-raster-fonts &optional FAMILIES)` | What the font database loaded (`:faces`, `:load-ms`) and the face each generic family, and each name in FAMILIES, resolves to. |
 
 ### Elisp: `emacs-egui.el` (web)
 
