@@ -6,7 +6,7 @@
 
 emacs-egui is a framework for [egui](https://github.com/emilk/egui) applications that run inside Emacs: an application implements one SDK trait, and either of two backends hosts it. The **native** backend links the application into an Emacs dynamic module that draws with [wgpu](https://github.com/gfx-rs/wgpu) on Metal into a view Emacs places in a buffer; it is the one to use for egui content, because a view shows its first frame about 10 ms after it is created (measured in a 320 × 200 card), runs with no helper process, and uses no CPU while nothing changes. The **web** backend compiles the same application to WebAssembly and shows it in an `xwidget-webkit` page; it is the one to use for content whose value is the web engine itself, and on an Emacs without the patch the native backend needs.
 
-Platforms: the native backend is macOS only (Apple silicon) and needs Emacs's `native` xwidget type, which comes from a [bendmacs-emacs](https://github.com/nohzafk/bendmacs-emacs) release (`emacs-31.1-bendmacs.2` or later) or from that repository's `patches/emacs-31/native-xwidget.patch` applied to your own build. The web backend needs Emacs 29.1 or later built with xwidgets.
+Platforms: the native backend is macOS only (Apple silicon) and needs Emacs's `native` xwidget type, which the `native-xwidget` patch of [bendmacs-emacs](https://github.com/nohzafk/bendmacs-emacs) adds: use one of its releases, or apply that patch to your own build. The web backend needs Emacs 29.1 or later built with xwidgets.
 
 **emacs-egui is not an Emacs package you install and use directly.** It is the SDK and runtime that an application is built on; end users install the application.
 
